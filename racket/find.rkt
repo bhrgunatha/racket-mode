@@ -1,146 +1,179 @@
 #lang racket/base
 
 (require racket/contract
-         (only-in racket/format ~a)
+         (only-in racket/function curry)
          racket/list
          racket/match
+         "identifier.rkt"
          "syntax.rkt")
 
 (provide find-definition
+         find-definition/drracket-jump
          find-signature)
+
+(module+ test
+  (require rackunit
+           racket/format))
+
+;; Note: Unfortunately identifier-binding can't report the definition
+;; id in the case of a contract-out and a rename-out, both. For
+;; `(provide (contract-out [rename orig new contract]))`
+;; identifier-binding reports (1) the contract wrapper as the id, and
+;; (2) `new` as the nominal-id -- but NOT (3) `orig`. We handle such
+;; cases; see `find-def-in-file` and its use of `$renaming-provde`,
+;; below.
+;;
+;; Another tricky case: "foo" is defined in def.rkt. repro.rkt
+;; requires def.rkt and re-provides "foo" using contract-out. When
+;; user.rkt requires repro.rkt, identifier-binding will report "foo"
+;; the id (yay!) but report the defining file is repro.rkt -- not
+;; def.rkt (boo!). We handle such cases.
 
 (define location/c (list/c path-string? natural-number/c natural-number/c))
 
-;; Try to find the definition of `str`, returning a list with the file
-;; name, line and column, 'kernel, or #f if not found.
-(define/contract (find-definition str)
-  (-> string? (or/c #f 'kernel location/c))
-  (match (find-definition/stx str)
-    [(list* stx file submods)
-     (list (path->string (or (syntax-source stx) file))
+;; Try to find a definition, using as a head start information
+;; supplied by drracket/check-syntax. It did the "fast" work for all
+;; uses (calling identifier-binding) and we recorded that answer to
+;; give the front end. If the user wants to visit any of those, the
+;; front end gives us that info, and we do the "slow" work.
+(define/contract (find-definition/drracket-jump how-path src-path submods id-strs)
+  (-> (and/c how/c (not/c 'namespace)) path-string? (listof symbol?) (listof string?)
+      (or/c #f 'kernel location/c))
+  (or (for/or ([id-str (in-list id-strs)])
+        (match (find-def-in-file (string->symbol id-str) how-path src-path submods)
+          [(list stx path _submods)
+           (list (->path-string (or (syntax-source stx) path))
+                 (or (syntax-line stx) 1)
+                 (or (syntax-column stx) 0))]
+          [v v]))
+      ;; Handle possible re-provide with a contract: Try again
+      ;; starting with that other src-path. i.e. Do automatically what
+      ;; the user could: Open that file, and try visit-definition
+      ;; again, there. from that.
+      (and (not (path-string-equal? how-path src-path))
+           (for/or ([id-str (in-list id-strs)])
+             (find-definition src-path id-str)))
+      ;; As a final fallback, return the reported file:1:0. At least
+      ;; give user a head start.
+      (list src-path 1 0)))
+
+;; Try to find a definition.
+(define/contract (find-definition how str)
+  (-> how/c string?
+      (or/c #f 'kernel location/c))
+  (match (find-def how str)
+    [(list stx path _submods)
+     (list (->path-string (or (syntax-source stx) path))
            (or (syntax-line stx) 1)
            (or (syntax-column stx) 0))]
     [v v]))
 
 ;; Try to find the definition of `str`, returning its signature or #f.
 ;; When defined in 'kernel, returns a form saying so, not #f.
-(define/contract (find-signature str)
-  (-> string? (or/c #f pair?))
-  (match (find-definition/stx str)
+(define/contract (find-signature how str)
+  (-> how/c string?
+      (or/c #f pair?))
+  (match (find-def how str)
     ['kernel '("defined in #%kernel, signature unavailable")]
-    [(list* id-stx file submods)
-     (define file-stx (file->syntax file))
-     (define sub-stx (submodule file submods file-stx))
-     (match ($signature (syntax-e id-stx) sub-stx)
-       [(? syntax? stx) (syntax->datum stx)]
-       [_ #f])]
+    [(list id-stx path submods)
+     (get-syntax how path
+                 (λ (mod-stx)
+                   (match ($signature (syntax-e id-stx)
+                                      (submodule-syntax submods mod-stx))
+                     [(? syntax? stx) (syntax->datum stx)]
+                     [_ #f])))]
     [v v]))
 
-(define/contract (find-definition/stx str)
-  (-> string?
-      (or/c #f 'kernel (cons/c syntax? (cons/c path? (listof symbol?)))))
-  (match (identifier-binding* str)
-    [(? list? xs)
-     (define ht (make-hash)) ;cache in case source repeated
-     (for/or ([x (in-list (remove-duplicates xs))])
-       (match x
-         [(cons id 'kernel) 'kernel]
-         [(list* id file submods)
-          (define (sub-stx file->stx)
-            (hash-ref! ht (cons file file->stx)
-                       (λ () (submodule file submods (file->stx file)))))
-          (match (or ($definition id (sub-stx file->expanded-syntax))
-                     (match ($renaming-provide id (sub-stx file->syntax))
-                       [(? syntax? s)
-                        ($definition (syntax-e s) (sub-stx file->expanded-syntax))]
-                       [_ #f]))
-            [#f  #f]
-            [stx (list* stx file submods)])]))]
-    [_ #f]))
+(define stx+path+mods/c (list/c syntax? path-string? (listof symbol?)))
 
-;; Distill identifier-binding to what we need. Unfortunately it can't
-;; report the definition id in the case of a contract-out and a
-;; rename-out, both. For `(provide (contract-out [rename orig new
-;; contract]))` it reports (1) the contract-wrapper as the id, and (2)
-;; `new` as the nominal-id -- but NOT (3) `orig`. Instead the caller
-;; will need try using `renaming-provide`.
-(define/contract (identifier-binding* v)
-  (-> (or/c string? symbol? identifier?)
-      (or/c #f
-            (listof (cons/c symbol?
-                            (or/c 'kernel
-                                  (cons/c path-string? (listof symbol?)))))))
-  (define sym->id namespace-symbol->identifier)
-  (define id (cond [(string? v)     (sym->id (string->symbol v))]
-                   [(symbol? v)     (sym->id v)]
-                   [(identifier? v) v]))
-  (match (identifier-binding id)
-    [(list source-mpi         source-id
-           nominal-source-mpi nominal-source-id
-           source-phase import-phase nominal-export-phase)
-     (list (cons source-id         (mpi->path source-mpi))
-           (cons nominal-source-id (mpi->path nominal-source-mpi)))]
-    [_ #f]))
+(define/contract (find-def how str)
+  (-> how/c string?
+      (or/c #f 'kernel stx+path+mods/c))
+  (->identifier-resolved-binding-info
+   how str
+   (λ (results)
+     (match results
+       [(? list? bindings)
+        (or (for/or ([x (in-list (remove-duplicates bindings))])
+              (match x
+                [(cons _id 'kernel) 'kernel]
+                [(list* id path submods) (find-def-in-file id how path submods)]))
+            ;; Handle possible re-provide with a contract: Try again
+            ;; starting with that other src-path. i.e. Automatically
+            ;; do what the user could: Open that file, and try
+            ;; visit-definition again, there.
+            (match results
+              [(list (list* src-id src-path src-subs)
+                     (list* nom-id _))
+               (or (and (or (equal? how 'namespace)
+                            (not (path-string-equal? how src-path)))
+                        (for/or ([id (in-list (list src-id nom-id))])
+                          (find-def (path->string src-path) (symbol->string id))))
+                   ;; As a final fallback, return the reported
+                   ;; file:1:0. At least give user a head start.
+                   (list (datum->syntax #f src-id (list src-path 1 0 #f #f))
+                         src-path
+                         '()))]
+              [_ #f]))]
+       [_ #f]))))
 
-(define/contract (mpi->path mpi)
-  (-> module-path-index?
-      (or/c 'kernel
-            (cons/c path-string? (listof symbol?))))
-  (define (hash-bang-symbol? v)
-    (and (symbol? v)
-         (regexp-match? #px"^#%" (symbol->string v))))
-  (match (resolved-module-path-name (module-path-index-resolve mpi))
-    [(? hash-bang-symbol?) 'kernel]
-    [(? path-string? path) (list path)]
-    [(? symbol? sym) (list (build-path (current-load-relative-directory)
-                                       (~a sym ".rkt")))]
-    [(list (? path-string? path) (? symbol? subs) ...)
-     (list* path subs)]))
+(define/contract (find-def-in-file id-sym how path submods)
+  (-> symbol? how/c path-string? (listof symbol?)
+      (or/c #f stx+path+mods/c))
+  (define subs (curry submodule-syntax submods))
+  (match (or (get-expanded-syntax
+              how path
+              (λ (stx)
+                ($definition id-sym (subs stx))))
+             (get-syntax
+              how path
+              (λ (stx)
+                (match ($renaming-provide id-sym (subs stx))
+                  [(? identifier? id)
+                   (define id-sym (syntax-e id))
+                   (get-expanded-syntax
+                    how path
+                    (λ (stx)
+                      ($definition id-sym (subs stx))))]
+                  [_ #f]))))
+    [(? syntax? stx) (list stx path submods)]
+    [_  #f]))
 
-;; For use with syntax-case*. When we use syntax-case for syntax-e equality.
-(define (syntax-e-eq? a b)
-  (eq? (syntax-e a) (syntax-e b)))
+;; Given a submodule path as a list of symbols, and the syntax for a
+;; file's entire module form: Return the (sub)module contents as
+;; #'(begin . contents).
+(define/contract (submodule-syntax sub-mod-syms stx)
+  (-> (listof symbol?) syntax? (or/c #f syntax?))
+  ;; Prepend #f as the outermost module name to match, meaning "any".
+  (sub-stx (cons #f sub-mod-syms) stx))
 
-(define ((make-eq-sym? sym) stx)
-  (and (eq? sym (syntax-e stx)) stx))
-
-(define (file-module file)
-  (match (path->string (last (explode-path file)))
-    [(pregexp "(.+?)\\.rkt$" (list _ v)) (string->symbol v)]))
-
-;; Return bodies (wrapped in begin) of the module indicated by
-;; file and sub-mod-syms.
-(define (submodule file sub-mod-syms stx)
-  (submodule* (cons (file-module file) sub-mod-syms) stx))
-
-(define (submodule* mods stx)
+(define (sub-stx mods stx)
   (match-define (cons this more) mods)
   (define (subs stxs)
     (if (empty? more)
         #`(begin . #,stxs)
-         (ormap (λ (stx) (submodule* more stx))
+         (ormap (λ (stx) (sub-stx more stx))
                 (syntax->list stxs))))
   (syntax-case* stx (module #%module-begin) syntax-e-eq?
     [(module name _ (#%module-begin . stxs))
-     (eq? this (syntax-e #'name))
+     (or (not this) (eq? this (syntax-e #'name)))
      (subs #'stxs)]
     [(module name _ . stxs)
-     (eq? this (syntax-e #'name))
+     (or (not this) (eq? this (syntax-e #'name)))
      (subs #'stxs)]
     [_ #f]))
 
 (module+ test
-  (require rackunit)
   (check-equal? (syntax->datum
-                 (submodule "/path/to/file.rkt" '(a b c)
-                            #'(module file racket
-                                (module a racket
-                                  (module not-b racket #f)
-                                  (module b racket
-                                    (module not-c racket #f)
-                                    (module c racket "bingo")
-                                    (module not-c racket #f))
-                                  (module not-b racket #f)))))
+                 (submodule-syntax '(a b c)
+                                   #'(module file racket
+                                       (module a racket
+                                         (module not-b racket #f)
+                                         (module b racket
+                                           (module not-c racket #f)
+                                           (module c racket "bingo")
+                                           (module not-c racket #f))
+                                         (module not-b racket #f)))))
                 '(begin "bingo")))
 
 ;; Given a symbol and syntax, return syntax corresponding to the
@@ -232,4 +265,74 @@
               [(orig s) (eq-sym? #'s) #'orig]
               [_        #f]))]
          [_ #f]))]
-    [_              #f]))
+    [_ #f]))
+
+(module+ test
+  ;; Just a quick smoke test. See test/find.rkt for many more tests.
+  ;;
+  ;; Exercise where the "how" is a path-string, meaning look up that
+  ;; path from our cache, not on disk.
+  (let ([path-str "/tmp/x.rkt"]
+        [code-str (~a `(module x racket/base
+                        (define (module-function-binding x y z) (+ 1 x))
+                        (define module-variable-binding 42)))])
+    (string->expanded-syntax path-str code-str void)
+    (check-equal? (find-signature path-str "module-function-binding")
+                  '(module-function-binding x y z))
+    (check-equal? (find-definition path-str "module-function-binding")
+                  `(,path-str 1 31))
+    (check-equal? (find-definition path-str "module-variable-binding")
+                  `(,path-str 1 79)))
+  ;; Exercise the "make-traversal" scenario described in comments
+  ;; above.
+  (let ([path-str "/tmp/x.rkt"]
+        [code-str (~a `(module x racket/base
+                        (require drracket/check-syntax)
+                        "make-traversal"))])
+    (string->expanded-syntax path-str code-str void)
+    (check-match (find-definition path-str "make-traversal")
+                 (list (pregexp "private/syncheck/traversals.rkt$") _ _))))
+
+;; These `get-syntax` and `get-expanded-syntax` functions handle where
+;; we get the syntax.
+;;
+;; The special case is when `how` is a path-string. That path doesn't
+;; necessarily exist as a file, or the file may be outdated. The path
+;; may simply be the syntax-source for a string from an unsaved Emacs
+;; buffer. So when we need to get syntax for such a path, we need to
+;; get it from our cache -- NOT from a file. (How it got in the cache
+;; previously was from some check-syntax.)
+;;
+;; Things like identifier-binding may tell us to look at such a path,
+;; or at a path for a real existing/updated file. This helps sort out
+;; the various cases.
+
+(define (get-syntax how path-str k)
+  (match how
+    ['namespace                (file->syntax path-str k)]
+    [(? path-string? how-path) (if (path-string-equal? path-str how-path)
+                                   (path->existing-syntax path-str k)
+                                   (file->syntax          path-str k))]))
+
+;; For when we use syntax-case* simply for syntax-e equality.
+(define (syntax-e-eq? a b)
+  (eq? (syntax-e a) (syntax-e b)))
+
+(define ((make-eq-sym? sym) stx)
+  (and (eq? sym (syntax-e stx)) stx))
+
+(define (get-expanded-syntax how path-str k)
+  (match how
+    ['namespace                (file->expanded-syntax path-str k)]
+    [(? path-string? how-path) (if (path-string-equal? path-str how-path)
+                                   (path->existing-expanded-syntax path-str k)
+                                   (file->expanded-syntax          path-str k))]))
+
+(define (path-string-equal? a b)
+  (equal? (->path-string a)
+          (->path-string b)))
+
+(define (->path-string v)
+  (cond [(path? v)        (path->string v)]
+        [(path-string? v) v]
+        [else             (error 'path-string-equal? "not a path or path-string?" v)]))

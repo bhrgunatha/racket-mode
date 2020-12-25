@@ -1,6 +1,6 @@
-;;; racket-font-lock.el
+;;; racket-font-lock.el -*- lexical-binding: t; -*-
 
-;; Copyright (c) 2013-2018 by Greg Hendershott.
+;; Copyright (c) 2013-2020 by Greg Hendershott.
 
 ;; Author: Greg Hendershott
 ;; URL: https://github.com/greghendershott/racket-mode
@@ -53,9 +53,7 @@
       ;; We don't put any comment syntax on these -- that way things
       ;; like indent and nav work within the sexp. They are solely
       ;; font-locked as comments, here.
-      (,#'racket--font-lock-sexp-comments
-       (1 font-lock-comment-delimiter-face t)
-       (2 font-lock-comment-face t))
+      (,#'racket--font-lock-sexp-comments)
 
       ;; #<< here strings
       ;;
@@ -95,13 +93,19 @@
               (or
                ;; #d #e #i or no hash prefix
                (seq (? "#" (any "dei"))
-                    (or (seq (? (any "-+"))
-                             (1+ digit)
-                             (? (any "./") (1+ digit)))
-                        (seq (1+ digit)
-                             ?e
-                             (? (any "-+"))
-                             (1+ digit))))
+                    (? (any "-+"))
+                    (1+ digit)
+                    (? (any "./") (1+ digit))
+                    (? ?e
+                       (? (any "-+"))
+                       (1+ digit))
+                    (? ?+
+                       (1+ digit)
+                       (? (any "./") (1+ digit))
+                       (? ?e
+                          (? (any "-+"))
+                          (1+ digit))
+                       ?i))
                ;; #x
                (seq "#x"
                     (? (any "-+"))
@@ -157,7 +161,7 @@
        1 font-lock-function-name-face)
 
       ;; let identifiers
-      (,#'racket--font-lock-let-identifiers . font-lock-variable-name-face)
+      (,#'racket--font-lock-let-identifiers)
 
       ;; module and module*
       (,(rx (syntax open-parenthesis)
@@ -241,28 +245,53 @@ doesn't really fit that.")
               racket-here-string-face)))
       font-lock-comment-face)))
 
-
-
 ;;; sexp comments
 
 (defun racket--font-lock-sexp-comments (limit)
   "Font-lock sexp comments.
 
-Note that the syntax table does NOT show these as comments in
-order to let indent and nav work within the sexp. We merely
-font-lock them as comments."
-  (ignore-errors
-    (when (re-search-forward (rx (group-n 1 "#;" (* " "))
-                                 (group-n 2 (not (any " "))))
-                             limit t)
-      (let ((md (match-data)))
-        (goto-char (match-beginning 2))
-        (forward-sexp 1)
-        (setf (elt md 5) (point)) ;set (match-end 2)
-        (set-match-data md)
-        t))))
+Note that our syntax table intentionally does not mark these as
+comments. As a result, indent and nav work within the sexp.
+Instead we merely font-lock them to look like comments.
 
-
+See https://docs.racket-lang.org/srfi/srfi-std/srfi-62.html for a
+discussion of s-expression comments. We try to handle nesting
+like \"#; #; 1 2\". For more examples see the issue 432 section
+of example/example.rkt."
+  (while (re-search-forward (rx "#;") limit t)
+    (if (racket--string-or-comment-p (match-beginning 0))
+        (goto-char (match-end 0))       ;issues #388, #408
+      (let ((first-prefix-begin (match-beginning 0)))
+        (racket--region-set-face (match-beginning 0) (match-end 0)
+                                 'font-lock-comment-delimiter-face t)
+        ;; Font-lock and count any additional successive prefixes
+        (goto-char (match-end 0))
+        (forward-comment (buffer-size))
+        (let ((num-prefixes 1))
+          (while (looking-at (rx "#;"))
+            (cl-incf num-prefixes)
+            (racket--region-set-face (match-beginning 0) (match-end 0)
+                                     'font-lock-comment-delimiter-face t)
+            (goto-char (match-end 0))
+            (forward-comment (buffer-size)))
+          ;; Font-lock as many successive sexprs as prefixes
+          (dotimes (_ num-prefixes)
+            (let ((beg (point)))
+              (forward-sexp 1)
+              (racket--region-set-face beg (point)
+                                       'font-lock-comment-face t)
+              (forward-comment (buffer-size)))))
+        ;; Cover everything from the beginning of the first prefix to
+        ;; the end of the last sexp with font-lock-multiline; #443.
+        (put-text-property first-prefix-begin (point)
+                           'font-lock-multiline t))))
+  nil)
+
+(defun racket--string-or-comment-p (pos)
+  (let ((state (syntax-ppss pos)))
+    (or (racket--ppss-string-p  state)
+        (racket--ppss-comment-p state))))
+
 ;;; let forms
 
 (defun racket--font-lock-let-identifiers (limit)
@@ -315,7 +344,6 @@ similar, it will already be there."
                    t))))))
   nil)
 
-
 ;;; misc
 
 (defun racket--inside-complete-sexp ()

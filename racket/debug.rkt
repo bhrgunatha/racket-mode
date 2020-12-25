@@ -4,28 +4,26 @@
          gui-debugger/marks
          racket/contract
          racket/format
-         racket/lazy-require
          racket/list
          racket/match
+         (only-in racket/path path-only)
          racket/set
-         racket/string
          syntax/modread
+         "debug-annotator.rkt"
+         "elisp.rkt"
          "interactions.rkt"
+         "repl-session.rkt"
          "util.rkt")
 
-(lazy-require ["debug-annotator.rkt" (annotate-for-single-stepping)])
+(module+ test
+  (require rackunit))
 
 (provide (rename-out [on-break-channel debug-notify-channel])
          debug-eval
          debug-resume
          debug-disable
          make-debug-eval-handler
-         next-break
-         set-debug-repl-namespace!)
-
-(define debug-repl-ns (make-base-namespace))
-(define (set-debug-repl-namespace! ns)
-  (set! debug-repl-ns ns))
+         next-break)
 
 ;; A gui-debugger/marks "mark" is a thunk that returns a
 ;; full-mark-struct -- although gui-debugger/marks doesn't provide
@@ -56,10 +54,15 @@
                 (seteq))
   annotated)
 
-(define break-when/c (or/c 'all 'none (cons/c path-string? pos/c)))
+;; The first contract is suitable for "edge" with Emacs Lisp. Second
+;; is important for actual `next-break` value so that `break?` compare
+;; of source works; see #425.
+(define break-when/c        (or/c 'all 'none (cons/c path-string? pos/c)))
+(define break-when-strict/c (or/c 'all 'none (cons/c path?        pos/c)))
+
 (define/contract next-break
-  (case-> (-> break-when/c)
-          (-> break-when/c void))
+  (case-> (-> break-when-strict/c)
+          (-> break-when-strict/c void))
   (let ([v 'none])
     (case-lambda [() v]
                  [(v!) (set! v v!)])))
@@ -90,6 +93,8 @@
   (define pos (case before/after
                 [(before)    (syntax-position stx)]
                 [(after)  (+ (syntax-position stx) (syntax-span stx) -1)]))
+  (define max-width 128)
+  (define limit-marker "⋯")
   (define locals
     (for*/list ([binding  (in-list (mark-bindings top-mark))]
                 [stx      (in-value (first binding))]
@@ -99,18 +104,30 @@
             (syntax-position stx)
             (syntax-span stx)
             (syntax->datum stx)
-            (~v (get/set!)))))
+            (~v #:max-width    max-width
+                #:limit-marker limit-marker
+                (get/set!)))))
   ;; Start a debug repl on its own thread, because below we're going to
   ;; block indefinitely with (channel-get on-resume-channel), waiting for
   ;; the Emacs front end to issue a debug-resume command.
-  (define repl-thread (parameterize ([current-namespace debug-repl-ns])
-                        (thread (repl src pos top-mark))))
+  (define repl-thread (thread (repl src pos top-mark)))
   ;; The on-break-channel is how we notify the Emacs front-end. This
   ;; is a synchronous channel-put but it should return fairly quickly,
-  ;; as soon as the TCP command server gets and writes it. In other
-  ;; words, this is sent as a notification, unlike a command response
-  ;; as a result of a request.
+  ;; as soon as the command server gets and writes it. In other words,
+  ;; this is sent as a notification, unlike a command response as a
+  ;; result of a request.
   (define this-break-id (new-break-id))
+  ;; If it is not possible to round-trip serialize/deserialize the
+  ;; values, use the original values when stepping (don't attempt to
+  ;; substitute user-supplied values).
+  (define (maybe-serialized-vals)
+    (let ([str (~s vals)])
+      (if (and (serializable? vals)
+               (<= (string-length str) max-width))
+          (cons #t str)
+          (cons #f (~s #:max-width    max-width
+                       #:limit-marker limit-marker
+                       vals)))))
   (channel-put on-break-channel
                (list 'debug-break
                      (cons src pos)
@@ -119,28 +136,53 @@
                      (cons this-break-id
                            (case before/after
                              [(before) (list 'before)]
-                             [(after)  (list 'after (~s vals))]))))
+                             [(after)  (list 'after (maybe-serialized-vals))]))))
   ;; Wait for debug-resume command to put to on-resume-channel. If
-  ;; wrong break ID, ignore and wait again. Note that some Racket
-  ;; values are non-serializable -- e.g. #<output-port> -- in which
-  ;; case just eat the exn:fail:read and use the original `vals`.
+  ;; wrong break ID, ignore and wait again.
   (let wait ()
     (begin0
         (match (channel-get on-resume-channel)
           [(list break-when (list (== this-break-id) 'before))
            (next-break (calc-next-break before/after break-when top-mark ccm))
            #f]
-          [(list break-when (list (== this-break-id) (or 'before 'after) vals-str))
+          [(list break-when (list (== this-break-id) 'before new-vals-str))
            (next-break (calc-next-break before/after break-when top-mark ccm))
-           (with-handlers ([exn:fail:read? (λ _ vals)])
-             (read (open-input-string vals-str)))]
+           (read-str/default new-vals-str vals)]
+          [(list break-when (list (== this-break-id) 'after new-vals-pair))
+           (next-break (calc-next-break before/after break-when top-mark ccm))
+           (match new-vals-pair
+             [(cons #t  new-vals-str) (read-str/default new-vals-str vals)]
+             [(cons '() _)            vals])]
           [_ (wait)])
       (kill-thread repl-thread)
       (newline))))
 
+(define (serializable? v)
+  (with-handlers ([exn:fail:read? (λ _ #f)])
+    (equal? v (write/read v))))
+
+(module+ test
+  (check-true (serializable? 42))
+  (check-true (serializable? 'foo))
+  (check-false (serializable? (open-output-string))))
+
+(define (write/read v)
+  (define out (open-output-string))
+  (write v out)
+  (define in (open-input-string (get-output-string out)))
+  (read in))
+
+(module+ test
+  (check-equal? (write/read 42) 42)
+  (check-equal? (write/read 'foo) 'foo))
+
+(define (read-str/default str default)
+  (with-handlers ([exn:fail:read? (λ _ default)])
+    (read (open-input-string str))))
+
 (define/contract (calc-next-break before/after break-when top-mark ccm)
   (-> (or/c 'before 'after) (or/c break-when/c 'over 'out) mark/c continuation-mark-set?
-      any)
+      break-when-strict/c)
   (define (big-step frames)
     (define num-marks (length (debug-marks (current-continuation-marks))))
     (or (for/or ([frame  (in-list frames)]
@@ -155,10 +197,15 @@
                  (cons src right))))
         'all))
   (match* [break-when before/after]
+    [['none _]       'none]
+    [['all  _]       'all]
     [['out  _]       (big-step                (debug-marks ccm))]
     [['over 'before] (big-step (cons top-mark (debug-marks ccm)))]
     [['over 'after]  'all]
-    [[v     _]       v]))
+    [[(cons (? path? path)            pos) _]
+     (cons path pos)]
+    [[(cons (? path-string? path-str) pos) _]
+     (cons (string->path path-str) pos)]))
 
 (define break-id/c nat/c)
 (define/contract new-break-id
@@ -169,7 +216,6 @@
   (-> continuation-mark-set? (listof mark/c))
   (continuation-mark-set->list ccm debug-key))
 
-
 ;;; Debug REPL
 
 (define ((repl src pos top-mark))
@@ -179,9 +225,19 @@
 (define ((make-prompt-read src pos top-mark))
   (define-values (_base name _dir) (split-path src))
   (define stx (get-interaction (format "[~a:~a]" name pos)))
-  (with-locals stx (mark-bindings top-mark)))
+  (call-with-session-context (current-session-id)
+                             with-locals stx (mark-bindings top-mark)))
 
 (define (with-locals stx bindings)
+  ;; Before or during module->namespace -- i.e. during a racket-run --
+  ;; current-namespace won't (can't) yet be a namespace with module
+  ;; body bindings. Indeed it might be from make-base-empty-namespace,
+  ;; and not even include racket/base bindings such as #%app. In that
+  ;; case make them available. That way the debug REPL at least can
+  ;; handle expressions involving local bindings.
+  (unless (member '#%app (namespace-mapped-symbols))
+    (log-racket-mode-debug "debug prompt-read namespace-require racket/base")
+    (namespace-require 'racket/base))
   ;; Note that mark-bindings is ordered from inner to outer scopes --
   ;; and can include outer variables shadowed by inner ones. So use
   ;; only the first occurence of each identifier symbol we encounter.
@@ -205,7 +261,7 @@
           (identifier? #'id)
           (hash-has-key? ht (syntax->datum #'id)))
      (let ([set (hash-ref ht (syntax->datum #'id))]
-           [v   (eval #'e debug-repl-ns)])
+           [v   (eval #'e)])
        (set v)
        #`(void))]
     ;; Wrap stx in a let-syntax form with a make-set!-transformer for
@@ -243,7 +299,7 @@
 (define locals/c (listof (list/c path-string? pos/c pos/c symbol? string?)))
 (define break-vals/c (cons/c break-id/c
                              (or/c (list/c 'before)
-                                   (list/c 'after string?))))
+                                   (list/c 'after (cons/c boolean? string?)))))
 (define on-break/c (list/c 'debug-break
                            break-when/c
                            breakable-positions/c
@@ -254,7 +310,7 @@
 (define resume-vals/c (cons/c break-id/c
                               (or/c (list/c 'before)
                                     (list/c 'before string?)
-                                    (list/c 'after string?))))
+                                    (list/c 'after (cons/c elisp-bool/c string?)))))
 (define on-resume/c (list/c (or/c break-when/c 'out 'over) resume-vals/c))
 (define/contract on-resume-channel (channel/c on-resume/c) (make-channel))
 
@@ -293,15 +349,13 @@
                   (eval-syntax (annotate (expand-syntax top-stx))))]
                [else (orig-eval top-stx)])]))
 
-;; This never seems to be called ???
 (define (load-module/annotate file m)
   (display-commented (format "~v" `(load-module/annotate ,file ,m)))
-  (define-values (base _ __) (split-path file))
   (call-with-input-file* file
     (λ (in)
       (port-count-lines! in)
       (parameterize ([read-accept-compiled #f]
-                     [current-load-relative-directory base])
+                     [current-load-relative-directory (path-only file)])
         (with-module-reading-parameterization
           (λ ()
             (define e (parameterize ([current-namespace (make-base-namespace)])

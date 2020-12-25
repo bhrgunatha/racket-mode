@@ -1,6 +1,6 @@
-;;; racket-custom.el
+;;; racket-custom.el -*- lexical-binding: t; -*-
 
-;; Copyright (c) 2013-2018 by Greg Hendershott.
+;; Copyright (c) 2013-2020 by Greg Hendershott.
 ;; Portions Copyright (C) 1985-1986, 1999-2013 Free Software Foundation, Inc.
 
 ;; Author: Greg Hendershott
@@ -26,7 +26,8 @@
 ;; In other words defcustom of racket-foo-bar has a :tag "Foo Bar".
 
 (require 'rx)
-(require 'sh-script) ;for sh-heredoc-face
+(require 'cl-lib)
+(require 'sh-script) ;for sh-heredoc face
 
 (defgroup racket nil
   "Editing and REPL for the Racket language."
@@ -55,22 +56,189 @@
   :risky t
   :group 'racket)
 
-(defcustom racket-command-port 55555
-  "Port number for Racket REPL command server."
-  :tag "Command Port"
-  :type 'integer
-  :risky t
-  :group 'racket)
+(make-obsolete-variable
+ 'racket-command-port
+ "This no longer has any effect. The Racket Mode back end chooses an ephemeral TCP port for REPL sessions and I/O."
+ "2020-04-25")
+
+(make-obsolete-variable
+  'racket-command-startup
+  "This no longer has any effect."
+  "2020-01-23")
 
 (defcustom racket-command-timeout 10
-  "Timeout for Racket REPL command server."
+  "How many seconds to wait for command server responses.
+
+Note: This is mostly obsolete, fortunately, because it applies
+only to commands that must block the Emacs UI until they get a
+response. Instead most Racket Mode commands these days receive
+their response asychronously."
   :tag "Command Timeout"
   :type 'integer
   :risky t
   :group 'racket)
 
+(defcustom racket-path-from-emacs-to-racket-function
+  #'identity
+  "A function used to transform Emacs Lisp pathnames before supplying to the Racket back end.
+
+If you run Emacs on Windows Subsystem for Linux, and want to run
+Racket programs using Windows Racket.exe rather than Linux
+racket, you can set this to `racket-wsl-to-windows'. In that case
+you probably also want to customize the \"reverse\":
+`racket-path-from-racket-to-emacs-function'."
+  :tag "Path from Emacs to Racket Function"
+  :type 'function
+  :safe 'functionp
+  :group 'racket)
+
+(defcustom racket-path-from-racket-to-emacs-function
+  (if racket--winp
+      (lambda (path) (subst-char-in-string ?\\ ?/ path))
+      #'identity)
+  "A function used to transform pathnames supplied by the Racket back end before using them in Emacs.
+
+The default on Windows replaces back with forward slashes. The
+default elsewhere is `identity'.
+
+If you run Emacs on Windows Subsystem for Linux, and want to run
+Racket programs using Windows Racket.exe rather than Linux
+racket, you can set this to `racket-windows-to-wsl'. In that case
+you probably also want to customize the \"reverse\":
+`racket-path-from-emacs-to-racket-function'."
+  :tag "Path from Racket to Emacs Function"
+  :type 'function
+  :safe #'functionp
+  :group 'racket)
+
+(defcustom racket-browse-url-function
+  (if (string-match "gnu" (symbol-name system-type))
+      #'browse-url
+    'racket-browse-url-using-temporary-file)
+  "Function to call to browse a URL.
+
+On Linux this defaults to `browse-url', otherwise it defaults to
+`racket-browse-url-using-temporary-file'."
+  :tag "Browse URL Function"
+  :type 'function
+  :safe #'functionp
+  :group 'racket)
+
+(defcustom racket-documentation-search-location
+  "https://docs.racket-lang.org/search/index.html?q=%s"
+  "The location of the Racket \"Search Manuals\" web page.
+Where `racket-documentation-search', `racket-xp-documentation'
+and `racket-repl-documentation' should look for the search page.
+
+- If the value of this variable is 'local, open the search page
+  from the local documentation, as with \"raco doc\".
+
+- Otherwise, the value is a string recognizable by `format', with
+  \"%s\" at the point at which to insert the user's search text.
+  the help desk. Apart from \"%s\", the string should be a
+  properly encoded URL."
+  :tag "Where to search documentation"
+  :type '(choice (string :tag "URL")
+                 (const :tag "Local" 'local))
+  :safe (lambda (val) (or (stringp val) (eq val 'local)))
+  :group 'racket)
+
+;;; Xp Mode
+
+(defgroup racket-xp nil
+  "`racket-xp-mode' options"
+  :tag "Xp Mode"
+  :group 'racket)
+
+(defcustom racket-xp-after-change-refresh-delay 1
+  "Seconds to wait before refreshing `racket-xp-mode' annotations.
+
+Set to nil to disable automatic refresh and manually use `racket-xp-annotate'."
+  :tag "Racket XP Mode After Change Refresh Delay"
+  :type '(choice (integer :tag "Seconds")
+                 (const :tag "Off" nil))
+  :safe #'integerp
+  :group 'racket-xp)
+
+(defcustom racket-xp-mode-lighter
+  '(:eval (racket--xp-mode-lighter))
+  "Mode line lighter for `racket-xp-mode'.
+
+Set to nil to disable the mode line completely."
+  :tag "Racket Xp Mode Lighter"
+  :type 'sexp
+  :risky t
+  :group 'racket-xp)
+
+(defcustom racket-xp-highlight-unused-regexp "^[^_]"
+  "Only give `racket-xp-unused-face' to unused bindings that match this regexp.
+
+The default is to highlight identifiers that do not start with
+an underline, which is a common convention."
+  :tag "Racket Xp Mode Do Not Highlight Unused Regexp"
+  :type 'regexp
+  :safe #'stringp
+  :group 'racket-xp)
+
+;;; REPL
+
+(defgroup racket-repl nil
+  "`racket-repl-mode' options"
+  :tag "REPL"
+  :group 'racket)
+
+(defcustom racket-repl-buffer-name-function nil
+  "How to associate `racket-mode' edit buffers with `racket-repl-mode' buffers.
+
+The default is nil, which is equivalent to supplying
+`racket-repl-buffer-name-shared': One REPL buffer is shared.
+
+Other predefined choices include `racket-repl-buffer-name-unique'
+and `racket-repl-buffer-name-project'.
+
+This is used when a `racket-mode' buffer is created. Changing
+this to a new value only affects `racket-mode' buffers created
+later.
+
+Any such function takes no arguments, should look at
+`buffer-file-name' if necessary, and either `setq-default' or
+`setq-local' the variable `racket-repl-buffer-name' to a desired
+`racket-repl-mode' buffer name. As a result, `racket-run'
+commands will use a buffer of that name, creating it if
+necessary."
+  :tag "REPL Buffer Name Function"
+  :type '(choice (const :tag "One REPL buffer for all edit buffers" nil)
+                 (const :tag "One REPL buffer for all project edit buffers" racket-repl--buffer-name-project)
+                 (const :tag "One REPL buffer for each edit buffer" racket-repl--buffer-name-unique)
+                 (function :tag "Other function"))
+  :group 'racket-repl)
+
+(defcustom racket-submodules-to-run '((test) (main))
+  "Extra submodules to run.
+
+This is a list of submodules. Each submodule is described as a
+list, to support submodules nested to any depth.
+
+This is used by commands that emulate the DrRacket Run command:
+
+\\<racket-mode-map>
+
+ - `racket-run'
+ - `racket-run-and-switch-to-repl' \\[racket-run-and-switch-to-repl]
+
+It is NOT used by commands that run one specific module, such as:
+
+ - `racket-run-module-at-point' \\[racket-run-module-at-point]
+ - `racket-test' \\[racket-test]
+ - `racket-profile'"
+  :tag "Submodules to Run"
+  :type '(repeat (repeat :tag "Module path" symbol))
+  :safe #'listp
+  :group 'racket-repl)
+
 (defcustom racket-memory-limit 2048
   "Terminate the Racket process if memory use exceeds this value in MB.
+
 Changes to this value take effect upon the next `racket-run'. A value
 of 0 means no limit.
 
@@ -81,67 +249,45 @@ the limit (maybe by a significant amount)."
   :tag "Memory Limit"
   :type 'integer
   :safe #'integerp
-  :group 'racket)
+  :group 'racket-repl)
 
 (defcustom racket-error-context 'medium
-  "The level of context used for `racket-run' error stack traces.
+  "The amount of context for error messages.
 
-Each level improves stack trace information, but causes your
-program to run more slowly.
+Each increasing level supplies better context (\"stack trace\")
+for error messages, but causing your program to run more slowly.
 
-  - 'low corresponds to `compile-context-preservation-enabled`
-    `#f`.
+  - low corresponds to compile-enforce-module-constants #t and
+    compile-context-preservation-enabled #f.
 
-  - 'medium corresponds to `compile-context-preservation-enabled`
-    `#t`, which disables some optimizations like inlining.
+  - medium corresponds to compile-enforce-module-constants #f and
+    compile-context-preservation-enabled #t, which disables some
+    optimizations like inlining.
 
-  - 'high corresponds to `compile-context-preservation-enabled`
-    `#t` and to use of `errortrace`, which heavily instruments
-    your code and therefore may be significantly slower.
+  - high corresponds to medium plus the use of errortrace, which
+    extensively instruments your code and therefore might cause
+    it to run significantly slower.
 
-Tip: Regardless of this setting, you can enable 'high errortrace
-for a specific `racket-run' using a C-u prefix. This lets you
-normally run with a faster setting, and temporarily re-run to get
-a more-helpful error message."
+Tip: Regardless of this setting, you can enable high errortrace
+for a specific `racket-run' or `racket-run-module-at-point' by
+using \\[universal-argument]. This lets you normally run with a
+lower, faster setting, and re-run when desired to get a
+more-helpful error message."
   :tag "Error Context"
   :type '(radio (const :tag "Low" low)
-                (const :tag "Medium (slower)" medium)
-                (const :tag "High (much slower)" high))
+                (const :tag "Medium (better context but slower)" medium)
+                (const :tag "High (best context but slowest)" high))
   :risky t
-  :group 'racket)
+  :group 'racket-repl)
 
-(defcustom racket-retry-as-skeleton t
-  "Retry a \"skeleton\" of files with errors, for identifier names?
+(make-obsolete-variable
+ 'racket-retry-as-skeleton
+ "The motivation for this is now N/A with `racket-xp-mode'."
+ "2020-02-26")
 
-When true: If your source file has an error, a \"skeleton\" of
-your file is evaluated to get identifiers from module languages,
-`require`s, and definitions. That way, things like completion and
-`racket-describe' are more likely to work while you edit the file
-to fix the error.
-
-Otherwise, you'll have only identifiers provided by racket/base,
-until you fix the error and run again.
-
-You might want to disable this if you work with files that take a
-very long time to expand -- because this feature needs to expand
-again when there is an error.
-
-Note: The retry "
-  :tag "Retry as Skeleton?"
-  :type 'boolean
-  :safe #'booleanp
-  :group 'racket)
-
-;;; REPL
-
-(defgroup racket-repl nil
-  "REPL Options"
-  :tag "REPL"
-  :group 'racket)
-
-(defcustom racket-history-filter-regexp "\\`\\s *\\S ?\\S ?\\s *\\'"
-  "Input matching this regexp are not saved on the history list.
-Defaults to a regexp ignoring all inputs of 0, 1, or 2 letters."
+(defcustom racket-history-filter-regexp "\\`\\s *\\'"
+  "Input matching this regexp are NOT saved on the history list.
+Default value is a regexp to ignore input that is all whitespace."
   :tag "History Filter Regexp"
   :type 'regexp
   :safe #'stringp
@@ -154,6 +300,28 @@ Defaults to a regexp ignoring all inputs of 0, 1, or 2 letters."
   :safe #'booleanp
   :group 'racket-repl)
 
+(defcustom racket-imagemagick-props nil
+  "Use ImageMagick with these properties for REPL images.
+
+When this property list is not empty -- and the variable
+`racket-images-inline' is true, and Emacs is built with with
+ImageMagick support -- then `create-image' is called with
+\"imagemagick\" as the type and with this property list.
+
+For example, to scale images whose width is larger than 500
+pixels, supply (:max-width 500)."
+  :tag "ImageMagick Props"
+  :type '(plist :key-type symbol
+                :value-type (choice number string))
+  :options '((:max-width integer)
+             (:max-height integer)
+             (:background string)
+             (:width integer)
+             (:height integer)
+             (:rotation float))
+  :risky t
+  :group 'racket-repl)
+
 (defcustom racket-images-keep-last 100
   "How many images to keep in the image cache."
   :tag "Images Keep Last"
@@ -161,24 +329,26 @@ Defaults to a regexp ignoring all inputs of 0, 1, or 2 letters."
   :safe #'integerp
   :group 'racket-repl)
 
-(defcustom racket-images-system-viewer "display"
-  "Which system image viewer program to invoke upon M-x
- `racket-view-last-image'."
+(defcustom racket-images-system-viewer (if (eq system-type 'darwin)
+                                           "open"
+                                         "display")
+  "The image viewer program to use for `racket-view-image'."
   :tag "Images System Viewer"
   :type 'string
   :risky t
   :group 'racket-repl)
 
 (defcustom racket-pretty-print t
-  "Use pretty-print instead of print in REPL."
+  "Use pretty-print instead of print in REPL?"
   :tag "Pretty Print"
   :type 'boolean
   :safe #'booleanp
   :group 'racket-repl)
 
 (defcustom racket-use-repl-submit-predicate nil
-  "Should `racket-repl-submit' use a drracket:submit-predicate? A
-language can provide such a predicate, for example when the
+  "Should `racket-repl-submit' use a drracket:submit-predicate?
+
+A language can provide such a predicate, for example when the
 language syntax is not s-expressions. When t `racket-repl-submit'
 will use this to decide whether to submit your input, yet."
   :tag "Use REPL Submit Predicate"
@@ -195,6 +365,7 @@ will use this to decide whether to submit your input, yet."
 
 (defcustom racket-indent-curly-as-sequence t
   "Indent `{}` with items aligned with the head item?
+
 This is indirectly disabled if `racket-indent-sequence-depth' is 0.
 This is safe to set as a file-local variable."
   :tag "Indent Curly As Sequence"
@@ -204,11 +375,12 @@ This is safe to set as a file-local variable."
 
 (defcustom racket-indent-sequence-depth 0
   "To what depth should `racket-indent-line' search.
-This affects the indentation of forms like `` '()` `() #() `` --
-and `{}` if `racket-indent-curly-as-sequence' is t -- but not
-`` #'() #`() ,() ,@() ``. A zero value disables, giving the
-normal indent behavior of DrRacket or Emacs `lisp-mode' derived
-modes like `scheme-mode'. Setting this to a high value can make
+
+This affects the indentation of forms like '() `() #() --
+and {} if `racket-indent-curly-as-sequence' is t --- but not
+#'() #`() ,() ,@(). A zero value disables, giving the normal
+indent behavior of DrRacket or Emacs `lisp-mode' derived modes
+like `scheme-mode'. Setting this to a high value can make
 indentation noticeably slower. This is safe to set as a
 file-local variable."
   :tag "Indent Sequence Depth"
@@ -218,6 +390,7 @@ file-local variable."
 
 (defcustom racket-pretty-lambda nil
   "Display lambda keywords using λ. This is DEPRECATED.
+
 Instead use `prettify-symbols-mode' in newer verisons of Emacs,
 or, use `racket-insert-lambda' to insert actual λ characters."
   :tag "Pretty Lambda"
@@ -226,7 +399,11 @@ or, use `racket-insert-lambda' to insert actual λ characters."
   :group 'racket-other)
 
 (defcustom racket-smart-open-bracket-enable nil
-  "Use `racket-smart-open-bracket' when `[` is pressed?"
+  "This variable is obsolete and has no effect.
+
+Instead of using this variable, you may bind the `[` key to the
+`racket-smart-open-bracket' command in the `racket-mode-map'
+and/or `racket-repl-mode-map' keymaps."
   :tag "Smart Open Bracket Enable"
   :type 'boolean
   :safe #'booleanp
@@ -237,8 +414,9 @@ or, use `racket-insert-lambda' to insert actual λ characters."
       (or (seq "module" (zero-or-one (any ?* ?+)))
           "library"))
   "Regexp for the start of a `module`-like form.
-Affects what `beginning-of-defun' will move to.
-This is safe to set as a file-local variable."
+
+Affects what `beginning-of-defun' will move to. This is safe to
+set as a file-local variable."
   :tag "Top Level Forms"
   :type 'string
   :safe #'stringp
@@ -276,6 +454,42 @@ level quieter. That way you can set the '* topic to a level like
                     xs))
   :group 'racket-other)
 
+(defcustom racket-show-functions
+  (list 'racket-show-pseudo-tooltip)
+  "A special hook variable to customize `racket-show'.
+
+Example functions include:
+
+  - `racket-show-pseudo-tooltip'
+  - `racket-show-echo-area'
+  - `racket-show-pos-tip'
+  - `racket-show-header-line'
+
+Each function should accept two arguments: VAL and POS.
+
+VAL is:
+
+  - Non-blank string: Display the string somehow.
+
+  - Blank string: Hide any previously displayed string.
+
+  - nil: Hide any persistent UI that might have been created to
+    show strings, such as by `racket-show-header-line'.
+
+POS is the buffer position for which to show the message. It may
+be nil only when VAL is nil or a blank string. When the buffer
+content is a span, POS should be the end of the span. That way,
+for example, a function that shows a tooltip can position it not
+to hide the interesting span in the buffer."
+  :tag "Racket Show Functions"
+  :type 'hook
+  :options '(racket-show-pseudo-tooltip
+             racket-show-echo-area
+             racket-show-header-line
+             racket-show-pos-tip)
+  :safe #'functionp
+  :group 'racket-other)
+
 ;;; Faces
 
 (defgroup racket-faces nil
@@ -293,15 +507,25 @@ level quieter. That way you can set the '* topic to a level like
        :tag ,tag
        :group 'racket-faces)))
 
-(defface-racket racket-check-syntax-def-face
-  '((t (:foreground "Black" :background "SeaGreen1" :weight bold)))
-  "Face `racket-check-syntax' uses to highlight definitions."
-  "Check Syntax Def Face")
+(defface-racket racket-xp-def-face
+  '((t (:inherit match :underline (:style line))))
+  "Face `racket-xp-mode' uses to highlight definitions."
+  "Definition Face")
 
-(defface-racket racket-check-syntax-use-face
-  '((t (:foreground "Black" :background "PaleGreen1" :slant italic)))
-  "Face `racket-check-syntax' uses to highlight uses."
-  "Check Syntax Use Face")
+(defface-racket racket-xp-use-face
+  '((t (:inherit match)))
+  "Face `racket-xp-mode' uses to highlight uses."
+  "Use Face")
+
+(defface-racket racket-xp-error-face
+  '((t (:underline (:color "red" :style wave))))
+  "Face `racket-xp-mode' uses to highlight errors."
+  "Error Face")
+
+(defface-racket racket-xp-unused-face
+  '((t (:strike-through t)))
+  "Face `racket-xp-mode' uses to highlight unused requires or definitions."
+  "Unused Face")
 
 (defface-racket racket-keyword-argument-face
   '((((background dark))
@@ -322,7 +546,7 @@ level quieter. That way you can set the '* topic to a level like
   "Selfeval Face")
 
 (defface-racket racket-here-string-face
-  '((t (:inherit sh-heredoc-face)))
+  '((t (:inherit sh-heredoc)))
   "Face for here strings."
   "Here String Face")
 

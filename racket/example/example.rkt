@@ -106,6 +106,12 @@ comment
 
 |#
 
+;; Issue 362
+
+#|aaa() |#
+
+#|(hello)|#
+
 #;(sexpr comment)
 
 ;; Nested sexpr comments
@@ -120,6 +126,35 @@ comment
 (let (#;[x #;1]
       [y 2])
   y)
+
+;; Issue 388
+1 ; #;
+2
+
+;; Issue 408
+
+"#;"whatever
+"#;"(whatever)
+"#;"
+(whatever)
+
+;; Issue 432
+
+#; #; 'comment-me 'comment-me 'but-not-me
+
+#;#; 'comment-me 'comment-me 'but-not-me
+
+#; #; #; 'comment-me 'comment-me 'comment-me 'but-not-me
+
+#;#;#; 'comment-me 'comment-me 'comment-me 'but-not-me
+
+#; ;; comment
+;; comment
+#; #| comment |#
+'comment-me
+'comment-me
+'but-not-me
+
 
 (define x #<<FOO
 asdfasdf
@@ -163,6 +198,9 @@ BAR
 
 ;; Issue 298
 (define x (begin "|" '\|))
+
+;; Issue 376
+(define || (|list|))
 
 (define (foo)
   (let ([x 10])
@@ -267,6 +305,16 @@ BAR
    #xf.f
    #x-f
    #xf
+
+   ;; exact complex, e.g. issue #445
+   1+2i
+   1/2+3/4i
+   1.0+3.0e7i
+
+   ;; negative exponent, e.g. issue #442
+   2.0e1
+   -2.0e2
+   -1e-1
    ))
 
 (define/contract (valid-bucket-name? s #:keyword [dns-compliant? #t])
@@ -300,3 +348,39 @@ BAR
                 (equal? c #\_))))]))
 
 (displayln "I'm running!")
+
+;; Issue 366
+#"1"
+#"22"
+#"333"
+
+;; Issue 448
+(fun #:1 #"a")
+(fun #:12 #"a")
+(fun #:123 #"a")
+(fun #:1234 #"a")
+(fun #:1 #px"a")
+(fun #:12 #px"a")
+(fun #:123 #px"a")
+(fun #:1234 #px"a")
+
+;; Issue 463
+(or (equal? c #\") (equal? c #\'))
+#\" #\"
+#\" ;comment
+#\' #\'
+#\' ;comment
+#\nul #\null #\backspace #\tab #\vtab #\newline #\linefeed
+#\page #\return #\space #\rubout
+#\012
+#\uF
+#\uFF
+#\uFFF
+#\uFFFF
+#\Ufffff
+#\Uffffff
+#\a #\z
+#\λ
+
+;; Issue 478
+(#|blah blah blah|# begin)

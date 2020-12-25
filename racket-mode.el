@@ -1,11 +1,11 @@
-;;; racket-mode.el --- Major mode for Racket language.
+;;; racket-mode.el --- Racket editing, REPL, and more  -*- lexical-binding: t; -*-
 
-;; Copyright (c) 2013-2018 by Greg Hendershott.
+;; Copyright (c) 2013-2020 by Greg Hendershott.
 
 ;; Package: racket-mode
-;; Package-Requires: ((emacs "24.3") (faceup "0.0.2") (s "1.9.0"))
+;; Package-Requires: ((emacs "25.1") (faceup "0.0.2") (pos-tip "20191127.1028"))
 ;; Author: Greg Hendershott
-;; URL: https://github.com/greghendershott/racket-mode
+;; URL: https://www.racket-mode.com/
 
 ;; License:
 ;; This is free software; you can redistribute it and/or modify it
@@ -23,18 +23,23 @@
 ;; - Focus on Racket lang.
 ;; - Follow DrRacket concepts where applicable.
 ;; - Thorough font-lock and indent.
-;; - Compatible with Emacs 24.3+ and Racket 6.0+.
+;; - Compatible with Emacs 25.1+ and Racket 6.9+.
 ;;
 ;; Details: https://github.com/greghendershott/racket-mode
 
 ;;; Code:
 
+(require 'racket-doc)
 (require 'racket-edit)
+(require 'racket-xp)
+(require 'racket-custom)
+(require 'racket-smart-open)
 (require 'racket-imenu)
 (require 'racket-profile)
 (require 'racket-logger)
 (require 'racket-stepper)
 (require 'racket-repl)
+(require 'racket-repl-buffer-name)
 (require 'racket-collection)
 (require 'racket-bug-report)
 (require 'racket-util)
@@ -43,7 +48,7 @@
 (defvar racket-mode-map
   (racket--easy-keymap-define
    '((("C-c C-c"
-       "C-c C-k")   racket-run)
+       "C-c C-k")   racket-run-module-at-point)
      ("C-c C-z"     racket-repl)
      ("<f5>"        racket-run-and-switch-to-repl)
      ("M-C-<f5>"    racket-racket)
@@ -61,19 +66,12 @@
      ("C-c C-x C-f" racket-open-require-path)
      ("TAB"         indent-for-tab-command)
      ("M-C-u"       racket-backward-up-list)
-     ("["           racket-smart-open-bracket)
-     (")"           racket-insert-closing)
-     ("]"           racket-insert-closing)
-     ("}"           racket-insert-closing)
      ("C-c C-p"     racket-cycle-paren-shapes)
      ("M-C-y"       racket-insert-lambda)
-     ("C-c C-d"     racket-doc)
-     ("C-c C-."     racket-describe)
-     ("M-."         racket-visit-definition)
-     ("M-C-."       racket-visit-module)
-     ("M-,"         racket-unvisit)
+     ("C-c C-d"     racket-documentation-search)
      ("C-c C-f"     racket-fold-all-tests)
-     ("C-c C-u"     racket-unfold-all-tests)))
+     ("C-c C-u"     racket-unfold-all-tests)
+     ((")" "]" "}") racket-insert-closing)))
   "Keymap for Racket mode.")
 
 (easy-menu-define racket-mode-menu racket-mode-map
@@ -101,9 +99,9 @@
     ["Switch to REPL" racket-repl]
     ("Tools"
      ["Profile" racket-profile]
-     ["Check Syntax" racket-check-syntax-mode]
      ["Error Trace" racket-run-with-errortrace]
-     ["Step Debug" racket-run-with-debugging])
+     ["Step Debug" racket-run-with-debugging]
+     ["Toggle XP Mode" racket-xp-mode])
     "---"
     ["Comment" comment-dwim]
     ["Insert λ" racket-insert-lambda]
@@ -112,9 +110,8 @@
     ["Align" racket-align]
     ["Unalign" racket-unalign]
     "---"
-    ["Visit Definition" racket-visit-definition]
-    ["Visit Module" racket-visit-module]
-    ["Return from Visit" racket-unvisit]
+    ["Visit Module" xref-find-definitions]
+    ["Return from Visit" xref-pop-marker-stack]
     "---"
     ["Open Require Path" racket-open-require-path]
     ["Find Collection" racket-find-collection]
@@ -126,62 +123,150 @@
     ["Trim Requires" racket-trim-requires]
     ["Use #lang racket/base" racket-base-requires]
     "---"
-    ["Racket Documentation" racket-doc]
-    ["Describe" racket-describe]
-    ["Start Faster" racket-mode-optimize-startup]
+    ["Start Faster" racket-mode-start-faster]
     ["Customize..." customize-mode]))
-
-(defun racket--variables-imenu ()
-  (setq-local imenu-case-fold-search t)
-  (setq-local imenu-create-index-function #'racket--imenu-create-index-function))
 
 ;;;###autoload
 (define-derived-mode racket-mode prog-mode
   "Racket"
-  "Major mode for editing Racket.
+  "Major mode for editing Racket source files.
+
 \\{racket-mode-map}"
   (racket--common-variables)
-  (racket--variables-imenu)
-  (hs-minor-mode t))
+  (setq-local imenu-create-index-function #'racket-imenu-create-index-function)
+  (hs-minor-mode t)
+  (setq-local completion-at-point-functions (list #'racket-complete-at-point))
+  (setq-local eldoc-documentation-function nil)
+  (funcall (or (and (functionp racket-repl-buffer-name-function)
+                    racket-repl-buffer-name-function)
+               #'racket-repl-buffer-name-shared))
+  (add-hook 'kill-buffer-hook
+            #'racket-mode-maybe-offer-to-kill-repl-buffer
+            nil t)
+  (add-hook 'xref-backend-functions
+            #'racket-mode-xref-backend-function
+            nil t))
 
 ;;;###autoload
 (progn
-  (add-to-list 'auto-mode-alist '("\\.rkt[dl]?\\'" . racket-mode))
+  ;; Use simple regexps for auto-mode-alist as they may be given to
+  ;; grep (e.g. by default implementation of `xref-find-references').
+  (add-to-list 'auto-mode-alist '("\\.rkt\\'" . racket-mode))
+  (add-to-list 'auto-mode-alist '("\\.rktd\\'" . racket-mode))
+  (add-to-list 'auto-mode-alist '("\\.rktl\\'" . racket-mode))
+  ;; "Fancier" regexp OK here:
   (modify-coding-system-alist 'file "\\.rkt[dl]?\\'"  'utf-8)
   (add-to-list 'interpreter-mode-alist '("racket" . racket-mode)))
 
 ;;;###autoload
 (defun racket-mode-start-faster ()
-  "Compile racket-mode's .rkt files for faster startup.
+  "Compile Racket Mode's .rkt files for faster startup.
 
-racket-mode is implemented as an Emacs Lisp \"front end\" that
-talks to a Racket process \"back end\". Because racket-mode is
+Racket Mode is implemented as an Emacs Lisp \"front end\" that
+talks to a Racket process \"back end\". Because Racket Mode is
 delivered as an Emacs package instead of a Racket package,
-installing it does _not_ do the `raco setup` that is normally
-done for Racket packages.
+installing it does not do the `raco setup` that is normally done
+for Racket packages.
 
-This command will do a `raco make` of racket-mode's .rkt files,
+This command will do a `raco make` of Racket Mode's .rkt files,
 creating bytecode files in `compiled/` subdirectories. As a
 result, when a `racket-run' or `racket-repl' command must start
 the Racket process, it will start faster.
 
-If you run this command, _ever_, you should run it _again_ after:
+If you run this command, ever, you should run it again after:
 
-- Installing an updated version of racket-mode. Otherwise, you
+- Installing an updated version of Racket Mode. Otherwise, you
   might lose some of the speed-up.
 
 - Installing a new version of Racket and/or changing the value of
   the variable `racket-program'. Otherwise, you might get an
   error message due to the bytecode being different versions."
   (interactive)
-  (dolist (dir (list racket--rkt-source-dir
-                     (concat racket--rkt-source-dir "/commands/")))
-    (let* ((command (format "%s -l raco make -v %s"
-                            racket-program
-                            (expand-file-name "*.rkt" dir)))
-           (prompt (format "Do `%s` " command)))
-      (when (y-or-n-p prompt)
-        (async-shell-command command)))))
+  (let* ((racket  (executable-find racket-program))
+         (rkts0   (expand-file-name "*.rkt" racket--rkt-source-dir) )
+         (rkts1   (expand-file-name "commands/*.rkt" racket--rkt-source-dir))
+         (command (format "%s -l raco make -v %s %s"
+                          (shell-quote-wildcard-pattern racket)
+                          (shell-quote-wildcard-pattern rkts0)
+                          (shell-quote-wildcard-pattern rkts1)))
+         (prompt (format "Do `%s` " command)))
+    (when (y-or-n-p prompt)
+      (async-shell-command command))))
+
+
+(defun racket-documentation-search ()
+  "Search documentation.
+
+This command is useful in several situations:
+
+- You are not using `racket-xp-mode' for a `racket-mode' edit
+  buffer, so `racket-xp-documentation' is not available.
+
+- There is no `racket-repl-mode' buffer with a live namespace, so
+  `racket-repl-documentation' is not available or helpful.
+
+- You want to search for definitions provided by all modules --
+  for example, the \"define\" syntax provided by racket/base, by
+  typed/racket/base, and by other modules, as well definitions or
+  topics that merely include \"define\".
+
+This command does not try to go directly to the help topic for a
+definition provided by any specific module. Instead it goes to
+the Racket \"Search Manuals\" page."
+  (interactive)
+  (racket--doc '(16) nil nil))
+
+;;; xref
+
+;; Note that this backend will be ignored when `racket-xp-mode' minor
+;; mode is active. This backend is a weak effort to do /something/ in
+;; plain `racket-mode' edit buffers, without using the Racket Mode
+;; back end process.
+;;
+;; Currently, aside from being able to visit relative require files,
+;; it just suggests using `racket-xp-mode' to find definitions.
+;;
+;; As for finding references: We just use the default
+;; `xref-backend-references' which greps within a project.
+;; `racket-xp-mode' is better only for intra-file references found by
+;; check-syntax; otherwise it defers to the same default, too.
+
+(defun racket-mode-xref-backend-function ()
+  'racket-mode-xref)
+
+(cl-defmethod xref-backend-identifier-at-point ((_backend (eql racket-mode-xref)))
+  (or (racket--module-path-name-at-point)
+      (thing-at-point 'symbol)))
+
+(cl-defmethod xref-backend-identifier-completion-table ((_backend (eql racket-mode-xref)))
+  (completion-table-dynamic #'ignore))
+
+(cl-defmethod xref-backend-definitions ((_backend (eql racket-mode-xref)) str)
+  (or (pcase (get-text-property 0 'racket-module-path str)
+        (`relative
+         (let ((path (expand-file-name (substring-no-properties str 1 -1))))
+           (list (xref-make str (xref-make-file-location path 1 0))))))
+      (list (xref-make str
+                       (xref-make-bogus-location
+                        "Cannot find definitions in plain `racket-mode'; see `racket-xp-mode'")))))
+
+;; Use the default `xref-backend-references', which greps within a project.
+
+;;; Commands that predate `racket-xp-mode'
+
+(defun racket-doc ()
+  "Instead please use `racket-documentation-search', `racket-xp-documentation' or `racket-repl-documentation'.
+See: <https://github.com/greghendershott/racket-mode/issues/439>"
+  (interactive)
+  (describe-function 'racket-doc))
+
+(defun racket-describe ()
+  "Instead please use `racket-xp-describe' or `racket-repl-describe'.
+See: <https://github.com/greghendershott/racket-mode/issues/439>"
+  (interactive)
+  (describe-function 'racket-describe))
+
+;; See also `racket-visit-definition' alias in racket-visit.el
 
 (provide 'racket-mode)
 

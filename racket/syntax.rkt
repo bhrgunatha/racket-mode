@@ -1,100 +1,214 @@
 #lang racket/base
 
-(require (only-in compiler/cm [get-file-sha1 file->digest])
+(require (only-in openssl/md5 md5)
          racket/contract
          racket/match
-         racket/promise
+         (only-in racket/path path-only)
          syntax/modread
-         "mod.rkt")
+         syntax/parse/define
+         "mod.rkt"
+         (prefix-in online-check-syntax-monitor: "online-check-syntax.rkt"))
 
-(provide file->syntax
+(provide with-expanded-syntax-caching-evaluator
+         file->syntax
          file->expanded-syntax
-         before-run
-         make-eval-handler
-         after-run)
+         string->expanded-syntax
+         path->existing-syntax
+         path->existing-expanded-syntax)
 
-;; Return a syntax object or #f for the contents of `file`. The
-;; resulting syntax is applied to `k` while the parameters
-;; current-load-relative-directory and current-namespace are still set
-;; appropriately.
-(define/contract (file->syntax file [k values])
+(define-logger racket-mode-syntax-cache)
+
+;; Return a syntax object for the contents of `path`. The resulting
+;; syntax is applied to `k` while the parameter
+;; current-load-relative-directory is set correctly for `path`.
+(define/contract (file->syntax path [k values])
   (->* (path-string?)
-       ((-> syntax? syntax?))
-       (or/c #f syntax?))
-  (define-values (base _ __) (split-path file))
-  (parameterize ([current-load-relative-directory base]
-                 [current-namespace (make-base-namespace)])
-    (with-handlers ([exn:fail? (λ _ #f)])
-      (k
-       (with-module-reading-parameterization
-         (λ ()
-           (with-input-from-file file read-syntax/count-lines)))))))
+       ((-> syntax? any))
+       any)
+  (define dir (path-only path))
+  (parameterize ([current-load-relative-directory dir]
+                 [current-directory               dir])
+    (k
+     (with-module-reading-parameterization
+       (λ ()
+         (with-input-from-file path
+           (λ ()
+             (port-count-lines! (current-input-port))
+             (match (read-syntax)
+               [(? eof-object?) #'""]
+               [stx stx]))))))))
 
-(define (read-syntax/count-lines)
-  (port-count-lines! (current-input-port))
-  (read-syntax))
+;; Same but from a string, where `path` is used for the load relative
+;; directory and given to read-syntax as the source
+(define/contract (string->syntax path code-str [k values])
+  (->* (path-string? string?)
+       ((-> syntax? any))
+       any)
+  (define dir (path-only path))
+  (parameterize ([current-load-relative-directory dir]
+                 [current-directory               dir])
+    (k
+     (with-module-reading-parameterization
+       (λ ()
+         (define in (open-input-string code-str))
+         (port-count-lines! in)
+         (match (read-syntax path in)
+           [(? eof-object?) #'""]
+           [stx stx]))))))
 
 ;;; expanded syntax caching
 
-;; cache : (hash/c file (cons/c digest-string? (or/c promise? syntax?)))
-(define cache (make-hash))
-(define last-mod #f)
+(define/contract (call-with-expanded-syntax-caching-evaluator maybe-mod thk)
+  (-> (or/c mod? #f) (-> any) any)
+  (parameterize ([current-eval (make-eval-handler maybe-mod)])
+    (thk)))
 
-;; Call this early in a file run, _before_ any evaluation. If it's not
-;; the same file as before, we empty the cache -- to free up memory.
-;; If it's the same file, we keep the cache.
-(define (before-run maybe-mod)
-  (unless (equal? last-mod maybe-mod)
-    (hash-clear! cache)
-    (set! last-mod maybe-mod)))
+(define-simple-macro (with-expanded-syntax-caching-evaluator mm:expr e:expr ...+)
+  (call-with-expanded-syntax-caching-evaluator mm (λ () e ...)))
 
-(define ((make-eval-handler maybe-mod [orig-eval (current-eval)]) e)
+(define ((make-eval-handler _maybe-mod [orig-eval (current-eval)]) e)
   (cond [(and (syntax? e)
               (syntax-source e)
               (path-string? (syntax-source e))
+              (complete-path? (syntax-source e))
+              (file-exists? (syntax-source e))
               (not (compiled-expression? (syntax-e e))))
          (define expanded-stx (expand e))
-         (cache-set! (syntax-source e) (λ () expanded-stx))
+         (cache-set! (syntax-source e)
+                     e
+                     expanded-stx
+                     (file->digest (syntax-source e))
+                     (current-namespace)
+                     (current-load-relative-directory))
          (orig-eval expanded-stx)]
         [else (orig-eval e)]))
 
-(define (after-run maybe-mod)
-  ;; When the rkt file being run has a compiled zo that was used, then
-  ;; our eval-hander above won't expand and cache any syntax. That
-  ;; means when the user does a command that needs expanded syntax
-  ;; (e.g. find-completion), they will need to wait for expansion. But
-  ;; if you call this _after_ the file was run, it will cache-set! the
-  ;; expansion using `delay/thread` -- i.e. the work will happen "in
-  ;; the background". (Furthermore, when we already have a cache entry
-  ;; for the file and digest, from a previous run, we'll just use
-  ;; that.) As a result, it's likely to be mostly or entirely ready
-  ;; when the user does a command.
-  (define-values (dir base _) (maybe-mod->dir/file/rmp maybe-mod))
-  (when (and dir base)
-    (define path (build-path dir base))
-    (cache-set! path (λ () (delay/thread (file->syntax path expand))))))
+;; cache : (hash/c path? cache-entry?)
+(struct cache-entry (stx exp-stx digest namespace load-relative-directory))
+(define cache (make-hash))
+(define last-mod #f)
 
-;; cache-set! takes a thunk so that, if the cache already has an entry
-;; for the file and digest, it can avoid doing any work. Furthermore,
-;; if you already have a digest for file, supply it to avoid redoing
-;; that work, too.
-(define/contract (cache-set! file thk [digest #f])
-  (->* (path-string? (-> (or/c promise? syntax?)))
-       ((or/c #f string?))
-       any)
-  (let ([digest (or digest (file->digest file))])
-    (match (hash-ref cache file #f)
-      [(cons (== digest) _)
-       (void)]
-      [_
-       (hash-set! cache file (cons digest (thk)))])))
+(define/contract (cache-set! path stx exp-stx digest namespace load-rel-dir)
+  (-> path? syntax? syntax? string? namespace? (or/c #f (and/c path-string? complete-path?)) any)
+  (hash-set! cache path
+             (cache-entry stx
+                          exp-stx
+                          digest
+                          namespace
+                          load-rel-dir)))
 
-(define (file->expanded-syntax file)
-  (define digest (file->digest file))
-  (match (hash-ref cache file #f)
-    [(cons (== digest) promise)
-     (force promise)]
+(define (->path v)
+  (cond [(path? v) v]
+        [(path-string? v) (string->path v)]
+        [else (error '->path "not path? or path-string?" v)]))
+
+;; Returns the result of applying `k` to the expanded syntax, with the
+;; correct parameterization of current-namespace and
+;; current-load-relative-directory. Note that `k` deliberately does
+;; not default to `values` because trying to use the syntax without
+;; the correct parameterizations will often result in bugs, sometimes
+;; subtle and confusing. So this "CPS" approach guides you to do the
+;; right thing.
+(define/contract (file->expanded-syntax path-str k)
+  (-> path-string? (-> syntax? any) any)
+  (define path (->path path-str))
+  (define digest (file->digest path))
+  (match (hash-ref cache path #f)
+    [(cache-entry _stx exp-stx (== digest) namespace load-rel-dir)
+     (log-racket-mode-syntax-cache-info "file->expanded-syntax cache hit ~v ~v" path digest)
+     (parameterize ([current-namespace               namespace]
+                    [current-load-relative-directory load-rel-dir]
+                    [current-directory               load-rel-dir])
+       (k exp-stx))]
     [_
-     (define stx (file->syntax file expand))
-     (cache-set! file (λ () stx) digest)
-     stx]))
+     (log-racket-mode-syntax-cache-info "file->expanded-syntax cache MISS ~v ~v" path digest)
+     (online-check-syntax-monitor:reset! path)
+     (file->syntax
+      path
+      (λ (stx)
+        ;; Create and parameterize a namespace here. file->syntax
+        ;; already parameterized the directory before calling us.
+        (parameterize ([current-namespace (make-base-namespace)])
+          (define exp-stx (expand stx))
+          (cache-set! path stx exp-stx digest (current-namespace) (current-load-relative-directory))
+          (k exp-stx))))]))
+
+;; Same but when you don't have a file.
+(define/contract (string->expanded-syntax path-str code-str k)
+  (-> path-string? string? (-> syntax? any) any)
+  (define path (->path path-str))
+  (define digest (string->digest code-str))
+  (match (hash-ref cache path #f)
+    [(cache-entry _stx exp-stx (== digest) namespace load-rel-dir)
+     (log-racket-mode-syntax-cache-info "string->expanded-syntax cache hit ~v ~v" path digest)
+     (parameterize ([current-namespace               namespace]
+                    [current-load-relative-directory load-rel-dir]
+                    [current-directory               load-rel-dir])
+       (k exp-stx))]
+    [_
+     (log-racket-mode-syntax-cache-info "string->expanded-syntax cache MISS ~v ~v" path digest)
+     (online-check-syntax-monitor:reset! path)
+     (string->syntax
+      path-str code-str
+      (λ (stx)
+        ;; Create and parameterize a namespace here. string->syntax
+        ;; already parameterized the directory before calling us.
+        (parameterize ([current-namespace (make-base-namespace)])
+          (define exp-stx (expand stx))
+          (cache-set! path stx exp-stx digest (current-namespace) (current-load-relative-directory))
+          (k exp-stx))))]))
+
+(define/contract (file->digest path)
+  (-> path? string?)
+  (call-with-input-file path md5))
+
+(define/contract (string->digest str)
+  (-> string? string?)
+  (md5 (open-input-string str)))
+
+;; Like string->syntax but given only the path-str and only if syntax
+;; already in the cache, as a result of previously calling
+;; string->expanded-syntax. Intended for use by identifier.rkt.
+(define/contract (path->existing-syntax path-str k)
+  (-> path-string? (-> syntax? any) any)
+  (define path (->path path-str))
+  (match (hash-ref cache path #f)
+    [(cache-entry stx _exp-stx _digest namespace load-rel-dir)
+     (log-racket-mode-syntax-cache-info "path->existing-syntax cache hit ~v (ignoring digest)" path)
+     (parameterize ([current-namespace               namespace]
+                    [current-load-relative-directory load-rel-dir]
+                    [current-directory               load-rel-dir])
+       (k stx))]
+    [#f
+     (log-racket-mode-syntax-cache-warning "path->existing-syntax cache MISS ~v (ignoring digest)" path)
+     #f]))
+
+;; Like string->expanded-syntax but given only the path-str and only
+;; if expanded syntax already in the cache, as a result of previously
+;; calling string->expanded-syntax. Intended for use by
+;; identifier.rkt.
+(define/contract (path->existing-expanded-syntax path-str k)
+  (-> path-string? (-> syntax? any) any)
+  (define path (->path path-str))
+  (match (hash-ref cache path #f)
+    [(cache-entry _stx exp-stx _digest namespace load-rel-dir)
+     (log-racket-mode-syntax-cache-info "path->existing-expanded-syntax cache hit ~v (ignoring digest)" path)
+     (parameterize ([current-namespace               namespace]
+                    [current-load-relative-directory load-rel-dir]
+                    [current-directory               load-rel-dir])
+       (k exp-stx))]
+    [#f
+     (log-racket-mode-syntax-cache-warning "path->existing-expanded-syntax cache MISS ~v (ignoring digest)" path)
+     #f]))
+
+(module+ test
+  (require rackunit
+           racket/file)
+  (define this-path (syntax-source #'here))
+  (define this-string (file->string this-path))
+  (check-equal? (file->digest this-path)
+                (string->digest this-string))
+  (check-equal? (file->expanded-syntax this-path values)
+                (string->expanded-syntax this-path this-string values))
+  (check-equal? (path->existing-expanded-syntax this-path (λ (_stx) 42))
+                42))

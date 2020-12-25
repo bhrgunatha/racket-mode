@@ -1,6 +1,6 @@
-;;; racket-util.el
+;;; racket-util.el -*- lexical-binding: t -*-
 
-;; Copyright (c) 2013-2016 by Greg Hendershott.
+;; Copyright (c) 2013-2020 by Greg Hendershott.
 ;; Portions Copyright (C) 1985-1986, 1999-2013 Free Software Foundation, Inc.
 
 ;; Author: Greg Hendershott
@@ -21,37 +21,50 @@
 (defun racket--easy-keymap-define (spec)
   "Make a sparse keymap with the bindings in SPEC.
 
-This is simply a way to DRY many calls to `define-key'.
-
 SPEC is
-  (list (list key-or-keys fn) ...)
+  (list (list KEY-OR-KEYS DEF) ...)
 
-where key-or-keys is either a string given to `kbd', or (for the
-case where multiple keys bind to the same command) a list of such
-strings."
+KEY-OR-KEYS is either a string given to `kbd', or, for the case
+where multiple keys bind to the same command, a list of such
+strings.
+
+DEF is the same as DEF for `define-key'."
   (let ((m (make-sparse-keymap)))
     (mapc (lambda (x)
             (let ((keys (if (listp (car x))
                             (car x)
                           (list (car x))))
-                  (fn (cadr x)))
+                  (def  (cadr x)))
               (mapc (lambda (key)
-                      (define-key m (kbd key) fn))
+                      (define-key m (kbd key) def))
                     keys)))
           spec)
     m))
 
-(defun racket--buffer-file-name ()
-  "Like `buffer-file-name' but always a non-propertized string."
-  (and (buffer-file-name)
-       (substring-no-properties (buffer-file-name))))
+(defun racket--buffer-file-name (&optional no-adjust)
+  "Like `buffer-file-name' but always a non-propertized string.
+
+Unless NO-ADJUST is not nil, applies the name to the function
+variable `racket-path-from-emacs-to-racket-function'."
+  (let ((v (and (buffer-file-name)
+                (substring-no-properties (buffer-file-name)))))
+    (if no-adjust
+        v
+      (funcall racket-path-from-emacs-to-racket-function
+               v))))
+
+(defun racket--get-buffer-recreate (bufname)
+  "Like `get-buffer-create' but re-creates the buffer if it already exists."
+  (let* ((buf (get-buffer bufname))
+         (_   (when buf (kill-buffer buf)))))
+  (get-buffer-create bufname))
 
 (defun racket--save-if-changed ()
   (unless (eq major-mode 'racket-mode)
     (user-error "Current buffer is not a racket-mode buffer"))
   (when (or (buffer-modified-p)
-            (and (racket--buffer-file-name)
-                 (not (file-exists-p (racket--buffer-file-name)))))
+            (and (buffer-file-name)
+                 (not (file-exists-p (buffer-file-name)))))
     (save-buffer)))
 
 (add-hook 'racket--repl-before-run-hook #'racket--save-if-changed)
@@ -71,17 +84,6 @@ a list of all modes in which Racket is edited."
     (`(,x . ,xs) (if (funcall pred x)
                      (cons x (racket--take-while xs pred))
                    `()))))
-
-(defun racket--thing-at-point (thing &optional no-properties)
-  "Like `thing-at-point' in Emacs 25+: Optional arg NO-PROPERTIES.
-Someday when we no longer support Emacs 24, we could delete this
-and callers just use `thing-at-point'."
-  (pcase (thing-at-point thing)
-    ((and (guard no-properties)
-          (pred stringp)
-          str)
-     (substring-no-properties str))
-    (v v)))
 
 (defconst racket--el-source-dir
   (file-name-directory (or load-file-name (racket--buffer-file-name)))
@@ -117,6 +119,94 @@ When installed as a package, this can be found from the variable
   (let ((b (get-buffer-create "*Racket Trace*")))
     (pop-to-buffer b t t)
     (setq truncate-lines t)))
+
+(defun racket--restoring-current-buffer (proc)
+  "Return a procedure restoring `current-buffer' during the dynamic extent of PROC."
+  (let ((buf (current-buffer)))
+    (lambda (&rest args)
+      (with-current-buffer buf
+        (apply proc args)))))
+
+;;; string trim
+
+;; "inline" the one thing we used from `s' so we can drop the dep.
+;; TO-DO: Rewrite racket--trim more simply; I just don't want to
+;; detour now.
+
+(defun racket--trim-left (s)
+  "Remove whitespace at the beginning of S."
+  (save-match-data
+    (if (string-match "\\`[ \t\n\r]+" s)
+        (replace-match "" t t s)
+      s)))
+
+(defun racket--trim-right (s)
+  "Remove whitespace at the end of S."
+  (save-match-data
+    (if (string-match "[ \t\n\r]+\\'" s)
+        (replace-match "" t t s)
+      s)))
+
+(defun racket--trim (s)
+  "Remove whitespace at the beginning and end of S."
+  (racket--trim-left (racket--trim-right s)))
+
+(defun racket--non-empty-string-p (v)
+  (and (stringp v)
+       (not (string-match-p "\\`[ \t\n\r]*\\'" v)))) ;`string-blank-p'
+
+(defun racket--symbol-at-point-or-prompt (force-prompt-p
+                                          prompt
+                                          &optional
+                                          completions
+                                          allow-blank-p)
+  "If symbol at point return it, else prompt user.
+
+When FORCE-PROMPT-P always prompt. The prompt uses
+`read-from-minibuffer' when COMPLETIONS is nil, else
+`ido-completing-read'.
+
+Returns `stringp' not `symbolp' to simplify using the result in a
+sexpr that can be passed to Racket backend. Likewise the string
+is trimmed and text properties are stripped.
+
+Unless ALLOW-BLANK-P, a blank string after trimming returns nil
+as if the user had C-g to quit."
+  (let ((sap (thing-at-point 'symbol t)))
+    (if (or force-prompt-p
+            (not sap))
+        (let* ((s (if completions
+                      (ido-completing-read prompt completions nil nil sap)
+                    (read-from-minibuffer prompt sap)))
+               (s (if s
+                      (racket--trim (substring-no-properties s))
+                    s)))
+          (if (or (not s)
+                  (and (not allow-blank-p) (equal "" s)))
+              nil
+            s))
+      sap)))
+
+(defconst racket--config-dir (file-name-as-directory
+                              (locate-user-emacs-file "racket-mode")))
+
+(defun racket-project-root (file)
+  "Given an absolute pathname for FILE, return its project root directory.
+
+The \"project\" is determined by trying, in order:
+
+- `projectile-project-root'
+- `vc-root-dir'
+- `project-current'
+- `file-name-directory'"
+  (let ((dir (file-name-directory file)))
+    (or (and (fboundp 'projectile-project-root)
+             (projectile-project-root dir))
+        (and (fboundp 'vc-root-dir)
+             (vc-root-dir))
+        (and (fboundp 'project-current)
+             (cdr (project-current nil dir)))
+        dir)))
 
 (provide 'racket-util)
 

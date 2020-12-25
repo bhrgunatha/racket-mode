@@ -1,6 +1,6 @@
 ;;; racket-debug.el -*- lexical-binding: t; -*-
 
-;; Copyright (c) 2018 by Greg Hendershott.
+;; Copyright (c) 2018-2020 by Greg Hendershott.
 
 ;; Author: Greg Hendershott
 ;; URL: https://github.com/greghendershott/racket-mode
@@ -61,7 +61,9 @@ file-local variable.")
   (cl-labels ((err (&rest args)
                    (user-error (concat "racket-debuggable-files: must be "
                                        (apply #'format args)))))
-    (let* ((dir (file-name-directory file-to-run))
+    (let* ((print-length nil) ;for %S
+           (print-level nil)  ;for %S
+           (dir (file-name-directory file-to-run))
            (xs  (if (functionp racket-debuggable-files)
                     (funcall racket-debuggable-files file-to-run)
                   racket-debuggable-files))
@@ -86,6 +88,7 @@ file-local variable.")
 ;;;###autoload
 (defun racket--debug-send-definition (beg end)
   (racket--cmd/async
+   (racket--repl-session-id)
    (save-excursion
      (goto-char beg)
      (list 'debug-eval
@@ -108,8 +111,9 @@ file-local variable.")
        (buf  (pop-to-buffer buf)))
      (goto-char pos)
      (pcase vals
-       (`(,_id before)   (message "Break before expression"))
-       (`(,_id after ,s) (message "Break after expression: (values %s" (substring s 1))))
+       (`(,_id before)          (message "Break before expression"))
+       (`(,_id after (,_ . ,s)) (message "Break after expression: (values %s"
+                                         (substring s 1))))
      (setq racket--debug-break-positions positions)
      (setq racket--debug-break-locals locals)
      (setq racket--debug-break-info vals)
@@ -120,7 +124,8 @@ file-local variable.")
   (let ((info (if value-prompt-p
                   (racket--debug-prompt-for-new-values)
                 racket--debug-break-info)))
-    (racket--cmd/async `(debug-resume (,next-break ,info))))
+    (racket--cmd/async (racket--repl-session-id)
+                       `(debug-resume (,next-break ,info))))
   (racket-debug-mode -1)
   (setq racket--debug-break-positions nil)
   (setq racket--debug-break-locals nil)
@@ -131,34 +136,35 @@ file-local variable.")
     (`(,id before)
      (pcase (read-from-minibuffer "Skip step, substituting values: " "()")
        ((or `nil "" "()") `(,id before))
-       (str  `(,id before ,str))))
-    (`(,id after ,orig)
+       (str               `(,id before ,str))))
+    (`(,id after (t . ,orig))
      (pcase (read-from-minibuffer "Step, replacing result values: " orig)
-       ((or `nil "" "()") `(,id after ,orig))
-       (new  `(,id after ,new))))))
+       ((or `nil "" "()") `(,id after (t . ,orig)))
+       (new               `(,id after (t . ,new)))))
+    (v v)))
 
 (defun racket-debug-step (&optional prefix)
-  "Resume to next breakable position. With prefix, substitute values."
+  "Resume to next breakable position. With \\[universal-argument] substitute values."
   (interactive "P")
   (racket--debug-resume 'all prefix))
 
 (defun racket-debug-step-over (&optional prefix)
-  "Resume over next expression. With prefix, substitute values."
+  "Resume over next expression. With \\[universal-argument], substitute values."
   (interactive "P")
   (racket--debug-resume 'over prefix))
 
 (defun racket-debug-step-out (&optional prefix)
-  "Resume out. With prefix, substitute values."
+  "Resume out. With \\[universal-argument], substitute values."
   (interactive "P")
   (racket--debug-resume 'out prefix))
 
 (defun racket-debug-continue (&optional prefix)
-  "Resume; don't break anymore. With prefix, substitute values."
+  "Resume; don't break anymore. With \\[universal-argument], substitute values."
   (interactive "P")
   (racket--debug-resume 'none prefix))
 
 (defun racket-debug-run-to-here (&optional prefix)
-  "Resume until point (if possible). With prefix, substitute values."
+  "Resume until point (if possible). With \\[universal-argument], substitute values."
   (interactive)
   (racket--debug-resume (cons (racket--buffer-file-name) (point)) prefix))
 
@@ -184,7 +190,7 @@ file-local variable.")
 
 (defun racket-debug-disable ()
   (interactive)
-  (racket--cmd/async `(debug-disable))
+  (racket--cmd/async (racket--repl-session-id) `(debug-disable))
   (racket-debug-mode -1)
   (setq racket--debug-break-positions nil)
   (setq racket--debug-break-locals nil)
@@ -201,11 +207,11 @@ file-local variable.")
 (define-minor-mode racket-debug-mode
   "Minor mode for debug breaks.
 
-> This feature is **EXPERIMENTAL**!!! It is likely to have
-> significant limitations and bugs. You are welcome to open an
-> issue to provide feedback. Please understand that this feature
-> might never be improved -- it might even be removed someday if
-> it turns out to have too little value and/or too much cost.
+This feature is **EXPERIMENTAL**!!! It is likely to have
+significant limitations and bugs. You are welcome to open an
+issue to provide feedback. Please understand that this feature
+might never be improved -- it might even be removed someday if it
+turns out to have too little value and/or too much cost.
 
 How to debug:
 
@@ -214,10 +220,12 @@ How to debug:
 
    a. Entire Files
 
-      Choose `racket-run' with two prefixes -- C-u C-u C-c C-c. The
-      file will be instrumented for step debugging before it is run.
-      Also instrumented are files determined by the variable
-      `racket-debuggable-files'.
+      Use two \\[universal-argument] command prefixes for either
+      `racket-run' or `racket-run-module-at-point'.
+
+      The file will be instrumented for step debugging before it
+      is run. Also instrumented are files determined by the
+      variable `racket-debuggable-files'.
 
       The run will break at the first breakable position.
 
@@ -228,7 +236,8 @@ How to debug:
 
    b. Function Definitions
 
-      Put point in a function `define` form and C-u C-M-x to
+      Move point inside a function definition form and use
+      \\[universal-argument] \\[racket-send-definition] to
       \"instrument\" the function for step debugging. Then in the
       REPL, enter an expression that causes the instrumented
       function to be run, directly or indirectly.
@@ -239,18 +248,18 @@ How to debug:
       example, to instrument a function you are about to call, so
       you can \"step into\" it:
 
-        - M-. a.k.a. `racket-visit-definition'.
-        - C-u C-M-x to instrument the definition.
-        - M-, a.k.a. `racket-unvisit'.
+        - \\[racket-xp-visit-definition] to visit the definition.
+        - \\[universal-argument] \\[racket-send-definition] to instrument the definition.
+        - \\[racket-unvisit] to return.
         - Continue stepping.
 
-      Limitation: Instrumenting a function `require`d from
-      another module won't redefine that function. Instead, it
-      attempts to define an instrumented function of the same
-      name, in the module the REPL is inside. The define will
-      fail if it needs definitions visible only in that other
-      module. In that case you'll probably need to use
-      entire-file instrumentation as described above.
+      Limitation: Instrumenting a function required from another
+      module won't redefine that function. Instead, it attempts
+      to define an instrumented function of the same name, in the
+      module the REPL is inside. The define will fail if it needs
+      definitions visible only in that other module. In that case
+      you'll probably need to use entire-file instrumentation as
+      described above.
 
 2. When a break occurs, the `racket-repl-mode' prompt changes. In
    this debug REPL, local variables are available for you to use
@@ -262,9 +271,7 @@ How to debug:
    position, local variable values, and result values -- and
    provides shortcut keys:
 
-```
 \\{racket-debug-mode-map}
-```
 "
   :lighter " RacketDebug"
   :keymap (racket--easy-keymap-define
@@ -291,7 +298,7 @@ How to debug:
          pos (+ pos span)
          'after-string (propertize val 'face racket-debug-locals-face))))
     (pcase racket--debug-break-info
-      (`(,_id after ,str)
+      (`(,_id after (,_ . ,str))
        (let ((eol (line-end-position)))
          (racket--debug-make-overlay
           (1- eol) eol

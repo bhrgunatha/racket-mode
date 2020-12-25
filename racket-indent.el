@@ -1,6 +1,6 @@
-;;; racket-indent.el  -*- lexical: t; -*-
+;;; racket-indent.el -*- lexical-binding: t; -*-
 
-;; Copyright (c) 2013-2017 by Greg Hendershott.
+;; Copyright (c) 2013-2020 by Greg Hendershott.
 ;; Portions Copyright (C) 1985-1986, 1999-2013 Free Software Foundation, Inc.
 
 ;; Author: Greg Hendershott
@@ -41,7 +41,7 @@
 
 ;; Having said all that, we still have the matter of `paredit-mode'.
 ;; It directly calls `lisp-indent-line' instead of `indent-function'.
-;; And, it directly calls `indent-sexp' instead of `prog-indent-sep'.
+;; And, it directly calls `indent-sexp' instead of `prog-indent-sexp'.
 ;; Therefore it gets `lisp-mode' indent, not ours. To address this,
 ;; advise those two functions to do the right thing when one of our
 ;; major modes is active.
@@ -53,61 +53,70 @@
   "When `racket--mode-edits-racket-p' instead use `prog-indent-sexp'."
   (apply (if (racket--mode-edits-racket-p) #'prog-indent-sexp orig)
          args))
-;; I don't want to muck with the old `defadvice' for this. Instead use
-;; `advice-add' in Emacs 24.4+. Although we still support Emacs 24.3,
-;; not sure how much longer; I'm OK having it silently not work.
 (when (fboundp 'advice-add)
   (advice-add 'lisp-indent-line :around #'racket--lisp-indent-line-advice)
   (advice-add 'indent-sexp :around #'racket--indent-sexp-advice))
 
-(defun racket-indent-line (&optional whole-exp)
+(defun racket-indent-line (&optional _whole-exp)
   "Indent current line as Racket code.
+
+Normally you don't need to use this command directly, it is used
+automatically when you press keys like RET or TAB. However you
+might refer to it when configuring custom indentation, explained
+below.
 
 This behaves like `lisp-indent-line', except that whole-line
 comments are treated the same regardless of whether they start
 with single or double semicolons.
 
-- Automatically indents forms that start with `begin` in the usual
-  way that `begin` is indented.
+- Automatically indents forms that start with \"begin\" in the
+  usual way that \"begin\" is indented.
 
-- Automatically indents forms that start with `def` or `with-` in the
-  usual way that `define` is indented.
+- Automatically indents forms that start with \"def\" or
+  \"with-\" in the usual way that \"define\" is indented.
 
 - Has rules for many specific standard Racket forms.
 
 To extend, use your Emacs init file to
 
+#+BEGIN_SRC racket
     (put SYMBOL 'racket-indent-function INDENT)
+#+END_SRC
 
-where `SYMBOL` is the name of the Racket form (e.g. `'test-case`)
-and `INDENT` is an integer or the symbol `'defun`. When `INDENT`
-is an integer, the meaning is the same as for
-`lisp-indent-function` and `scheme-indent-function`: Indent the
-first `n` arguments specially and then indent any further
-arguments like a body.
+SYMBOL is the name of the Racket form like \"'test-case\" and
+INDENT is an integer or the symbol \"'defun\". When INDENT is an
+integer, the meaning is the same as for lisp-indent-function and
+scheme-indent-function: Indent the first INDENT arguments
+specially and indent any further arguments like a body.
 
-For example in your `.emacs` file you could use:
+For example:
 
+#+BEGIN_SRC racket
     (put 'test-case 'racket-indent-function 1)
+#+END_SRC
 
-to change the indent of `test-case` from this:
+This will change the indent of `test-case` from this:
 
+#+BEGIN_SRC racket
     (test-case foo
                blah
                blah)
+#+END_SRC
 
 to this:
 
+#+BEGIN_SRC racket
     (test-case foo
       blah
       blah)
+#+END_SRC
 
-If `racket-indent-function` has no property for a symbol,
-`scheme-indent-function` is also considered (although the with-x
-indents defined by `scheme-mode` are ignored). This is only to
-help people who may have extensive `scheme-indent-function`
-settings, particularly in the form of file or dir local
-variables. Otherwise prefer `racket-indent-function`."
+If `racket-indent-function' has no property for a symbol,
+scheme-indent-function is also considered, although the \"with-\"
+indents defined by scheme-mode are ignored. This is only to help
+people who may have extensive scheme-indent-function settings,
+particularly in the form of file or dir local variables.
+Otherwise prefer putting properties on `racket-indent-function'."
   (interactive)
   (pcase (racket--calculate-indent)
     (`()  nil)
@@ -192,6 +201,8 @@ the `racket-indent-function` property."
                body-indent) ;just like 'defun
               ((string-match (rx bos "begin") head)
                (racket--indent-special-form 0 indent-point state))
+              ((string-match (rx bos (or "for/" "for*/")) head)
+               (racket--indent-for indent-point state))
               (t
                (racket--normal-indent indent-point state)))))))
 
@@ -241,7 +252,7 @@ To handle nested items, we search `backward-up-list' up to
                       (setq answer nil))))
              (eq answer t))))))
 
-(defun racket--normal-indent (indent-point state)
+(defun racket--normal-indent (_indent-point state)
   ;; Credit: Substantially borrowed from clojure-mode
   (goto-char (racket--ppss-last-sexp state))
   (backward-prefix-chars)
@@ -379,8 +390,9 @@ ignore a short list defined by scheme-mode itself."
 (defun racket--set-indentation ()
   "Set indentation for various Racket forms.
 
-Note that `beg*`, `def*` and `with-*` aren't listed here because
-`racket-indent-function' handles those.
+Note that `racket-indent-function' handles some forms -- e.g.
+`begin*`, `def*` `for/*`, `with-*` -- with regexp matches for
+anything not explicitly listed here.
 
 Note that indentation is set for the symbol alone, and also with
 a : suffix for legacy Typed Racket. For example both `let` and
@@ -411,42 +423,15 @@ doesn't hurt to do so."
           (do 2)
           (dynamic-wind 0)
           (fn 1) ;alias for lambda (although not officially in Racket)
+          ;; for/ and for*/ forms default to racket--indent-for unless
+          ;; otherwise specified here
           (for 1)
           (for/list racket--indent-for)
-          (for/vector racket--indent-for)
-          (for/hash racket--indent-for)
-          (for/hasheq racket--indent-for)
-          (for/hasheqv racket--indent-for)
-          (for/and racket--indent-for)
-          (for/or racket--indent-for)
           (for/lists racket--indent-for/fold)
-          (for/first racket--indent-for)
-          (for/last racket--indent-for)
           (for/fold racket--indent-for/fold)
-          (for/flvector racket--indent-for)
-          (for/set racket--indent-for)
-          (for/seteq racket--indent-for)
-          (for/seteqv racket--indent-for)
-          (for/sum racket--indent-for)
-          (for/product racket--indent-for)
           (for* 1)
-          (for*/list racket--indent-for)
-          (for*/vector racket--indent-for)
-          (for*/hash racket--indent-for)
-          (for*/hasheq racket--indent-for)
-          (for*/hasheqv racket--indent-for)
-          (for*/and racket--indent-for)
-          (for*/or racket--indent-for)
           (for*/lists racket--indent-for/fold)
-          (for*/first racket--indent-for)
-          (for*/last racket--indent-for)
           (for*/fold racket--indent-for/fold)
-          (for*/flvector racket--indent-for)
-          (for*/set racket--indent-for)
-          (for*/seteq racket--indent-for)
-          (for*/seteqv racket--indent-for)
-          (for*/sum racket--indent-for)
-          (for*/product racket--indent-for)
           (instantiate 2)
           (interface 1)
           (λ 1)

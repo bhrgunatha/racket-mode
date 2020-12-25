@@ -1,6 +1,7 @@
 #lang at-exp racket/base
 
-(require (only-in errortrace/errortrace-key
+(require data/interval-map
+         (only-in errortrace/errortrace-key
                   errortrace-key)
          (only-in errortrace/errortrace-lib
                   print-error-trace
@@ -8,11 +9,16 @@
          (only-in errortrace/stacktrace
                   stacktrace^
                   stacktrace@
-                  stacktrace-imports^)
+                  stacktrace-imports^
+                  original-stx
+                  expanded-stx)
+         racket/dict
          racket/format
          racket/match
+         racket/set
          racket/unit
          syntax/parse
+         "repl-session.rkt"
          "util.rkt")
 
 (provide make-instrumented-eval-handler
@@ -21,23 +27,14 @@
          instrumenting-enabled
          test-coverage-enabled
          clear-test-coverage-info!
-         get-test-coverage-info
+         get-uncovered
          profiling-enabled
          clear-profile-info!
-         get-profile-info)
+         get-profile)
 
 ;;; Core instrumenting
 
 (define instrumenting-enabled (make-parameter #f))
-
-;; These two parameters added to errortrace/stacktrace circa 6.0. They
-;; help make-st-mark capture the original, unexpanded syntax, which is
-;; nicer to report in a stack trace. Lacking that in older Rackets,
-;; the srcloc is still correct and Emacs next-error will work.
-(define original-stx (with-handlers ([exn:fail? (λ _ (make-parameter #f))])
-                       (dynamic-require 'errortrace/stacktrace 'original-stx)))
-(define expanded-stx (with-handlers ([exn:fail? (λ _ (make-parameter #f))])
-                       (dynamic-require 'errortrace/stacktrace 'expanded-stx)))
 
 (define ((make-instrumented-eval-handler [orig-eval (current-eval)]) orig-exp)
   ;; This is modeled after the one in DrRacket.
@@ -82,13 +79,17 @@
               (warn-about-time-apply expanded-e)
               (orig-eval annotated))])))]))
 
+(define warned-sessions (mutable-set))
 (define (warn-about-time-apply stx)
   (syntax-parse stx
     #:datum-literals (#%app time-apply)
     [(#%app time-apply . _)
-     (display-commented
-      @~a{Warning: time or time-apply used in errortrace annotated code.
-                   For meaningful timings, use command-line racket instead!})
+     (unless (set-member? warned-sessions (current-session-id))
+       (set-add! warned-sessions (current-session-id))
+       (display-commented
+        @~a{Warning: time or time-apply used in errortrace annotated code.
+            Instead use command-line racket for more-accurate measurements.
+            (Will not warn again for this REPL session.)}))
        #t]
     [(ss ...) (for/or ([stx (in-list (syntax->list #'(ss ...)))])
                   (warn-about-time-apply stx))]
@@ -144,23 +145,27 @@
   (and v (with-syntax ([v v])
            #'(#%plain-app set-mcar! v #t))))
 
-(define (get-test-coverage-info)
+(define (get-uncovered source)
   ;; Due to macro expansion (e.g. to an `if` form), there may be
   ;; multiple data points for the exact same source location. We want
   ;; to logically OR them: If any are true, the source location is
   ;; covered.
-  (define ht (make-hash)) ;; (list src pos span) => cover?
-  (for* ([(stx v) (in-hash  test-coverage-info)]
-         [cover?  (in-value (mcar v))]
-         [loc     (in-value (list (syntax-source stx)
-                                  (syntax-position stx)
-                                  (syntax-span stx)))])
-    (match (hash-ref ht loc 'none)
-      ['none (hash-set! ht loc cover?)]
-      [#f    (when cover? (hash-set! ht loc #t))]
-      [#t    (void)]))
-  (for/list ([(loc cover?) (in-hash ht)])
-    (cons cover? loc)))
+  (define im (make-interval-map))
+  (for ([(stx v) (in-hash test-coverage-info)])
+    (define covered? (mcar v))
+    (unless covered?
+      (when (equal? source (syntax-source stx))
+        (define beg (syntax-position stx))
+        (define end (+ beg (syntax-span stx)))
+        (interval-map-set! im beg end #t))))
+  ;; interval-map-set! doesn't merge adjacent identical intervals so:
+  (let loop ([xs (dict-keys im)])
+    (match xs
+      [(list) (list)]
+      [(list* (cons beg same) (cons same end) more)
+       (loop (list* (cons beg end) more))]
+      [(cons this more)
+       (cons this (loop more))])))
 
 ;;; Profiling
 
@@ -169,7 +174,6 @@
 (define profiling-enabled (make-parameter #f)) ;stacktrace-imports^
 
 (define profile-info (make-hasheq)) ;(hash/c any/c prof?)
-
 
 (define (clear-profile-info!)
   (hash-clear! profile-info))
@@ -203,10 +207,18 @@
      (set-prof-time! p (+ (- (current-process-milliseconds) start)
                           (prof-time p))))))
 
-(define (get-profile-info)
+(define (get-profile)
   (for/list ([x (in-list (hash-values profile-info))])
-    (match-define (prof nest? count msec name stx) x)
-    (list count msec name stx)))
+    (match-define (prof _nest? count msec name stx) x)
+    (define src (syntax-source stx))
+    (define beg (syntax-position stx))
+    (define end (and beg (+ beg (syntax-span stx))))
+    (list count
+          msec
+          (and name (symbol->string name))
+          (and src (path? src) (path->string src))
+          beg
+          end)))
 
 
 ;;; Finally, invoke the unit

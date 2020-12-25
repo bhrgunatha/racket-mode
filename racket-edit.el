@@ -1,6 +1,6 @@
 ;;; racket-edit.el -*- lexical-binding: t -*-
 
-;; Copyright (c) 2013-2018 by Greg Hendershott.
+;; Copyright (c) 2013-2020 by Greg Hendershott.
 ;; Portions Copyright (C) 1985-1986, 1999-2013 Free Software Foundation, Inc.
 
 ;; Author: Greg Hendershott
@@ -16,150 +16,32 @@
 ;; General Public License for more details. See
 ;; http://www.gnu.org/licenses/ for details.
 
-;; racket-mode per se, i.e. the .rkt file buffers
+;; racket-mode per se, i.e. the mode for .rkt file buffers
 
 (require 'cl-lib)
 (require 'cl-macs)
+(require 'comint)
+(require 'ido)
 (require 'racket-custom)
+(require 'racket-cmd)
 (require 'racket-common)
 (require 'racket-complete)
+(require 'racket-repl)
 (require 'racket-util)
 (require 'hideshow)
-(require 'tooltip)
-
-(defun racket-run (&optional prefix)
-  "Save and evaluate the buffer in REPL.
-
-With one C-u prefix, uses errortrace for improved stack traces.
-Otherwise follows the `racket-error-context' setting.
-
-With two C-u prefixes, instruments code for step debugging. See
-`racket-debug-mode' and the variable `racket-debuggable-files'.
-
-If point is within a Racket `module` form, the REPL \"enters\"
-that submodule (uses its language info and namespace).
-
-When you run again, the file is evaluated from scratch -- the
-custodian releases resources like threads and the evaluation
-environment is reset to the contents of the file. In other words,
-like DrRacket, this provides the predictability of a \"static\"
-baseline, plus the ability to explore interactively using the
-REPL.
-
-See also `racket-run-and-switch-to-repl', which is even more like
-DrRacket's Run because it selects the REPL window (gives it the
-focus), too.
-
-When `racket-retry-as-skeleton' is true, if your source file has
-an error, a \"skeleton\" of your file is evaluated to get
-identifiers from module languages, `require`s, and definitions.
-That way, things like completion and `racket-describe' are more
-likely to work while you edit the file to fix the error. If not
-even the \"skeleton\" evaluation succeeds, you'll have only
-identifiers provided by racket/base, until you fix the error and
-run again.
-
-Output in the `*Racket REPL*` buffer that describes a file and
-position is automatically \"linkified\". Examples of such text
-include:
-
-- Racket error messages.
-- `rackunit` test failure location messages.
-- `print`s of `#<path>` objects.
-
-To visit these locations, move point there and press RET or mouse
-click. Or, use the standard `next-error' and `previous-error'
-commands."
-  (interactive "P")
-  (racket--repl-run (racket--what-to-run)
-                    (pcase prefix
-                      (`(4)  'high)
-                      (`(16) 'debug)
-                      (_     racket-error-context))
-                    nil))
-
-(defun racket-run-with-errortrace ()
-  "Run with `racket-error-context' temporarily set to 'high.
-This is just `racket-run' with a C-u prefix. Defined as a function so
-it can be a menu target."
-  (interactive)
-  (racket-run '(4)))
-
-(defun racket-run-with-debugging ()
-  "Run with `racket-error-context' temporarily set to 'debug.
-This is just `racket-run' with a double C-u prefix. Defined as a
-function so it can be a menu target."
-  (interactive)
-  (racket-run '(16)))
-
-(defun racket-run-and-switch-to-repl (&optional prefix)
-  "This is `racket-run' followed by `racket-switch-to-repl'."
-  (interactive "P")
-  (racket-run prefix)
-  (racket-repl))
+(require 'xref)
 
 (defun racket-racket ()
-  "Do `racket <file>` in `*shell*` buffer."
+  "Do \"racket <file>\" in a shell buffer."
   (interactive)
-  (racket--shell (concat racket-program
+  (racket--shell (concat (shell-quote-argument racket-program)
                          " "
                          (shell-quote-argument (racket--buffer-file-name)))))
 
-(defun racket-test (&optional coverage)
-  "Run the `test` submodule.
-
-With prefix, runs with coverage instrumentation and highlights
-uncovered code.
-
-Put your tests in a `test` submodule. For example:
-
-    (module+ test
-      (require rackunit)
-      (check-true #t))
-
-rackunit test failure messages show the location. You may use
-`next-error' to jump to the location of each failing test.
-
-See also:
-- `racket-fold-all-tests'
-- `racket-unfold-all-tests'
-"
-  (interactive "P")
-  (let ((mod-path (list 'submod (racket--buffer-file-name) 'test))
-        (buf (current-buffer)))
-    (if (not coverage)
-        (racket--repl-run mod-path)
-      (message "Running test submodule with coverage instrumentation...")
-      (racket--repl-run
-       mod-path
-       'coverage
-       (lambda (_what)
-         (message "Getting coverage results...")
-         (racket--cmd/async
-          `(get-uncovered)
-          (lambda (xs)
-            (pcase xs
-              (`() (message "Full coverage."))
-              ((and xs `((,beg0 . ,_) . ,_))
-               (message "Missing coverage in %s place(s)." (length xs))
-               (with-current-buffer buf
-                 (dolist (x xs)
-                   (let ((o (make-overlay (car x) (cdr x) buf)))
-                     (overlay-put o 'name 'racket-uncovered-overlay)
-                     (overlay-put o 'priority 100)
-                     (overlay-put o 'face font-lock-warning-face)))
-                 (goto-char beg0)))))))))))
-
-(add-hook 'racket--repl-before-run-hook #'racket--remove-coverage-overlays)
-
-(defun racket--remove-coverage-overlays ()
-  (remove-overlays (point-min) (point-max) 'name 'racket-uncovered-overlay))
-
 (defun racket-raco-test ()
-  "Do `raco test -x <file>` in `*shell*` buffer.
-To run <file>'s `test` submodule."
+  "Do \"raco test -x <file>\" in a shell buffer to run the \"test\" submodule."
   (interactive)
-  (racket--shell (concat racket-program
+  (racket--shell (concat (shell-quote-argument racket-program)
                          " -l raco test -x "
                          (shell-quote-argument (racket--buffer-file-name)))))
 
@@ -176,122 +58,6 @@ To run <file>'s `test` submodule."
       (select-window w)
       (sit-for 3))))
 
-
-;;; visiting defs and mods
-
-(defun racket-visit-definition (&optional prefix)
-  "Visit definition of symbol at point.
-
-Use \\[racket-unvisit] to return.
-
-Please keep in mind the following limitations:
-
-- Only finds symbols defined in the current namespace. You may
-  need to `racket-run' the current buffer, first.
-
-- Only visits the definition of module-level identifiers --
-  things for which Racket's `identifier-binding` function returns
-  information. This does _not_ include things such as
-  local (nested) function definitions or `racket/class` member
-  functions. To find those in the same file, you'll need to use a
-  normal Emacs text search function like `isearch-forward'.
-
-- If the definition is found in Racket's `#%kernel` module, it
-  will tell you so but won't visit the definition site."
-  (interactive "P")
-  (pcase (racket--symbol-at-point-or-prompt prefix "Visit definition of: ")
-    (`nil nil)
-    (str (if (and (eq major-mode 'racket-mode)
-                  (not (equal (racket--cmd/await `(path+md5))
-                              (cons (racket--buffer-file-name) (md5 (current-buffer)))))
-                  (y-or-n-p "Run current buffer first? "))
-             (racket--repl-run nil nil
-                               (lambda (_what)
-                                 (racket--do-visit-def-or-mod 'def str)))
-           (racket--do-visit-def-or-mod 'def str)))))
-
-(defun racket-visit-module (&optional prefix)
-  "Visit definition of module at point, e.g. net/url or \"file.rkt\".
-
-Use \\[racket-unvisit] to return.
-
-See also: `racket-find-collection'."
-  (interactive "P")
-  ;; `thing-at-point' 'filename matches both net/url and "file.rkt".
-  ;; It returns the latter without the quotes; add them back if
-  ;; `syntax-ppss' says it's a string.
-  (let* ((v (racket--thing-at-point 'filename t))
-         (v (if (and v (racket--ppss-string-p (syntax-ppss)))
-                (concat "\"" v "\"")
-              v))
-         (v (if (or prefix (not v))
-                (read-from-minibuffer "Visit module: " (or v ""))
-              v)))
-    ;; If the module name is quoted e.g. "file.rkt", just do
-    ;; equivalent of `find-file-at-point'. Else ask back-end.
-    (cond ((and (equal "\"" (substring v 0 1))
-                (equal "\"" (substring v -1 nil)))
-           (racket--push-loc)
-           (find-file (expand-file-name (substring v 1 -1)))
-           (message "Type M-, to return"))
-          (t (racket--do-visit-def-or-mod 'mod v)))))
-
-(defun racket--do-visit-def-or-mod (cmd str)
-  "CMD must be 'def or 'mod. STR must be `stringp`."
-  (cl-case major-mode
-    (racket-mode t)
-    ((racket-repl-mode racket-describe-mode) (racket--repl-ensure-buffer-and-process))
-    (otherwise (user-error "Requires racket-mode or racket-repl-mode")))
-  (pcase (racket--cmd/await (list cmd str))
-    (`(,path ,line ,col)
-     (racket--push-loc)
-     (find-file path)
-     (goto-char (point-min))
-     (forward-line (1- line))
-     (forward-char col)
-     (message "Type M-, to return"))
-    (`kernel
-     (message "`%s' defined in #%%kernel -- source not available." str))
-    (_
-     (message "Not found."))))
-
-(defvar racket--loc-stack '())
-
-(defun racket--push-loc ()
-  (push (cons (current-buffer) (point))
-        racket--loc-stack))
-
-(defun racket-unvisit ()
-  "Return from previous `racket-visit-definition' or `racket-visit-module'."
-  (interactive)
-  (if racket--loc-stack
-      (pcase (pop racket--loc-stack)
-        (`(,buffer . ,pt)
-         (pop-to-buffer-same-window buffer)
-         (goto-char pt)))
-    (message "Stack empty.")))
-
-(defun racket-doc (&optional prefix)
-  "View documentation of the identifier or string at point.
-
-Uses the default external web browser.
-
-If point is an identifier required in the current namespace that
-has help, opens the web browser directly at that help
-topic. (i.e. Uses the identifier variant of racket/help.)
-
-Otherwise, opens the 'search for a term' page, where you can
-choose among multiple possibilities. (i.e. Uses the string
-variant of racket/help.)
-
-With a C-u prefix, prompts for the identifier or quoted string,
-instead of looking at point."
-  (interactive "P")
-  (pcase (racket--symbol-at-point-or-prompt prefix "Racket help for: ")
-    (`nil nil)
-    (str (racket--cmd/async `(doc ,str)))))
-
-
 ;;; code folding
 
 ;;;###autoload
@@ -318,14 +84,15 @@ instead of looking at point."
   (interactive)
   (racket--for-all-tests "Unfolded" 'hs-show-block))
 
-
 ;;; requires
 
 (defun racket-tidy-requires ()
-  "Make a single top-level `require`, modules sorted, one per line.
+  "Make a single \"require\" form, modules sorted, one per line.
 
-All top-level `require` forms are combined into a single form.
-Within that form:
+The scope of this command is the innermost module around point,
+including the outermost module for a file using a \"#lang\" line.
+All require forms within that module are combined into a single
+form. Within that form:
 
 - A single subform is used for each phase level, sorted in this
   order: for-syntax, for-template, for-label, for-meta, and
@@ -335,80 +102,99 @@ Within that form:
 
     - Collection path modules -- sorted alphabetically.
 
-    - Subforms such as `only-in`.
+    - Subforms such as only-in.
 
     - Quoted relative requires -- sorted alphabetically.
 
-At most one module is listed per line.
-
-Note: This only works for requires at the top level of a source
-file using `#lang`. It does *not* work for `require`s inside
-`module` forms.
+At most one required module is listed per line.
 
 See also: `racket-trim-requires' and `racket-base-requires'."
   (interactive)
   (unless (eq major-mode 'racket-mode)
     (user-error "Current buffer is not a racket-mode buffer"))
-  (pcase (racket--top-level-requires 'find)
-    (`nil (user-error "The file module has no requires; nothing to do"))
-    (reqs (pcase (racket--cmd/await `(requires/tidy ,reqs))
-            ("" nil)
-            (new (goto-char (racket--top-level-requires 'kill))
-                 (insert (concat new "\n")))))))
+  (racket--tidy-requires '() #'ignore))
+
+(defun racket--tidy-requires (add callback)
+  (pcase (append (racket--module-requires 'find) add)
+    (`() (user-error "The module has no requires; nothing to do"))
+    (reqs (racket--cmd/async
+           nil
+           `(requires/tidy ,reqs)
+           (lambda (result)
+             (pcase result
+               ("" nil)
+               (new
+                (pcase (racket--module-requires 'kill)
+                  (`()
+                   (goto-char (racket--inside-innermost-module))
+                   (forward-line 1))
+                  (pos (goto-char pos)))
+                (let ((pt (point)))
+                  (insert new)
+                  (when (eq (char-before pt) ?\n)
+                    (newline))
+                  (indent-region pt (1+ (point)))
+                  (goto-char pt))))
+             (funcall callback result))))))
 
 (defun racket-trim-requires ()
   "Like `racket-tidy-requires' but also deletes unnecessary requires.
 
-Note: This only works when the source file can be evaluated with
-no errors.
+Note: This only works when the source file can be fully expanded
+with no errors.
 
 Note: This only works for requires at the top level of a source
-file using `#lang`. It does *not* work for `require`s inside
-`module` forms. Furthermore, it is not smart about `module+` or
-`module*` forms -- it may delete top level requires that are
+file using #lang. It does NOT work for require forms inside
+module forms. Furthermore, it is not smart about module+ or
+module* forms -- it might delete top level requires that are
 actually needed by such submodules.
 
 See also: `racket-base-requires'."
   (interactive)
   (unless (eq major-mode 'racket-mode)
     (user-error "Current buffer is not a racket-mode buffer"))
-  (when (racket--ok-with-module+*)
+  (when (racket--submodule-y-or-n-p)
    (racket--save-if-changed)
-   (pcase (racket--top-level-requires 'find)
+   (pcase (racket--module-requires 'find t)
      (`nil (user-error "The file module has no requires; nothing to do"))
-     (reqs (pcase (racket--cmd/await `(requires/trim
-                                       ,(racket--buffer-file-name)
-                                       ,reqs))
-             (`nil (user-error "Syntax error in source file"))
-             (""   (goto-char (racket--top-level-requires 'kill)))
-             (new  (goto-char (racket--top-level-requires 'kill))
-                   (insert (concat new "\n"))))))))
+     (reqs (racket--cmd/async
+            nil
+            `(requires/trim
+              ,(racket--buffer-file-name)
+              ,reqs)
+            (lambda (result)
+              (pcase result
+                (`nil (user-error "Syntax error in source file"))
+                (""   (goto-char (racket--module-requires 'kill t)))
+                (new  (goto-char (racket--module-requires 'kill t))
+                      (insert (concat new "\n"))))))))))
 
 (defun racket-base-requires ()
-  "Change from `#lang racket` to `#lang racket/base`.
+  "Change from \"#lang racket\" to \"#lang racket/base\".
 
-Adds explicit requires for modules that are provided by `racket`
-but not by `racket/base`.
+Adds explicit requires for imports that are provided by
+\"racket\" but not by \"racket/base\".
 
 This is a recommended optimization for Racket applications.
-Avoiding loading all of `racket` can reduce load time and memory
-footprint.
+Avoiding loading all of \"racket\" can reduce load time and
+memory footprint.
 
 Also, as does `racket-trim-requires', this removes unneeded
 modules and tidies everything into a single, sorted require form.
 
-Note: This only works when the source file can be evaluated with
-no errors.
+Note: This only works when the source file can be fully expanded
+with no errors.
 
 Note: This only works for requires at the top level of a source
-file using `#lang`. It does *not* work for `require`s inside
-`module` forms. Furthermore, it is not smart about `module+` or
-`module*` forms -- it may delete top level requires that are
+file using #lang. It does NOT work for require forms inside
+module forms. Furthermore, it is not smart about module+ or
+module* forms -- it might delete top level requires that are
 actually needed by such submodules.
 
-Note: Currently this only helps change `#lang racket` to
-`#lang racket/base`. It does *not* help with other similar conversions,
-such as changing `#lang typed/racket` to `#lang typed/racket/base`."
+Note: Currently this only helps change \"#lang racket\" to
+\"#lang racket/base\". It does not help with other similar
+conversions, such as changing \"#lang typed/racket\" to \"#lang
+typed/racket/base\"."
   (interactive)
   (unless (eq major-mode 'racket-mode)
     (user-error "Current buffer is not a racket-mode buffer"))
@@ -416,22 +202,26 @@ such as changing `#lang typed/racket` to `#lang typed/racket/base`."
     (user-error "Already using #lang racket/base. Nothing to change."))
   (unless (racket--buffer-start-re "^#lang.*? racket$")
     (user-error "File does not use use #lang racket. Cannot change."))
-  (when (racket--ok-with-module+*)
+  (when (racket--submodule-y-or-n-p)
     (racket--save-if-changed)
-    (let ((reqs (racket--top-level-requires 'find)))
-      (pcase (racket--cmd/await `(requires/base
-                                  ,(racket--buffer-file-name)
-                                  ,reqs))
-        (`nil (user-error "Syntax error in source file"))
-        (new (goto-char (point-min))
-             (re-search-forward "^#lang.*? racket$")
-             (insert "/base")
-             (goto-char (or (racket--top-level-requires 'kill)
-                            (progn (insert "\n\n") (point))))
-             (unless (string= "" new)
-               (insert (concat new "\n"))))))))
+    (let ((reqs (racket--module-requires 'find t)))
+      (racket--cmd/async
+       nil
+       `(requires/base
+         ,(racket--buffer-file-name)
+         ,reqs)
+       (lambda (result)
+         (pcase result
+           (`nil (user-error "Syntax error in source file"))
+           (new (goto-char (point-min))
+                (re-search-forward "^#lang.*? racket$")
+                (insert "/base")
+                (goto-char (or (racket--module-requires 'kill t)
+                               (progn (insert "\n\n") (point))))
+                (unless (string= "" new)
+                  (insert (concat new "\n"))))))))))
 
-(defun racket--ok-with-module+* ()
+(defun racket--submodule-y-or-n-p ()
   (save-excursion
     (goto-char (point-min))
     (or (not (re-search-forward (rx ?\( "module" (or "+" "*")) nil t))
@@ -446,300 +236,141 @@ such as changing `#lang typed/racket` to `#lang typed/racket/base`."
       (re-search-forward re)
       t)))
 
-(defun racket--top-level-requires (what)
-  "Identify all top-level requires and do WHAT.
+(defun racket--module-requires (what &optional outermost-p)
+  "Identify all require forms and do WHAT.
 
-When WHAT is 'find, returns the top-level require forms.
+When WHAT is 'find, return the require forms.
 
-When WHAT is 'kill, kill the top-level requires, returning the
-location of the first one."
+When WHAT is 'kill, kill the require forms and return the
+position where the first one had started.
+
+OUTERMOST-P says which module's requires: true means the
+outermost file module, nil means the innermost module around
+point."
   (save-excursion
-    (goto-char (point-min))
+    (goto-char (if outermost-p
+                   (point-min)
+                 (racket--inside-innermost-module)))
     (let ((first-beg nil)
           (requires nil))
-      (while (re-search-forward "^(require " nil t)
-        (let* ((beg (progn (up-list -1)   (point)))
-               (end (progn (forward-sexp) (point)))
-               (str (buffer-substring-no-properties beg end))
-               (sexpr (read str)))
-          (unless first-beg (setq first-beg beg))
-          (setq requires (cons sexpr requires))
-          (when (eq 'kill what)
-            (kill-sexp -1)
-            (delete-blank-lines))))
+      (while
+          (condition-case nil
+              (let ((end (progn (forward-sexp  1) (point)))
+                    (beg (progn (forward-sexp -1) (point))))
+                (unless (equal end (point-max))
+                  (when (prog1 (racket--looking-at-require-form)
+                          (goto-char end))
+                    (unless first-beg (setq first-beg beg))
+                    (push (read (buffer-substring-no-properties beg end))
+                          requires)
+                    (when (eq 'kill what)
+                      (delete-region beg end)
+                      (delete-blank-lines)))
+                  t))
+            (scan-error nil)))
       (if (eq 'kill what) first-beg requires))))
 
-
-;;; racket-check-syntax
+(defun racket--inside-innermost-module ()
+  "Position of the start of the inside of the innermost module
+around point. This could be \"(point-min)\" if point is within no
+module form, meaning the outermost, file module."
+  (save-excursion
+    (racket--escape-string-or-comment)
+    (condition-case ()
+        (progn
+          (while (not (racket--looking-at-module-form))
+            (backward-up-list))
+          (down-list)
+          (point))
+      (scan-error (point-min)))))
 
-(defvar racket--highlight-overlays nil)
+(defun racket--looking-at-require-form ()
+  ;; Assumes you navigated to point using a method that ignores
+  ;; strings and comments, preferably `forward-sexp'.
+  (and (eq ?\( (char-syntax (char-after)))
+       (save-excursion
+         (down-list 1)
+         (looking-at "require"))))
 
-(defun racket--highlight (beg end defp)
-  ;; Unless one of our highlight overlays already exists there...
-  (let ((os (overlays-at beg)))
-    (unless (cl-some (lambda (o) (member o racket--highlight-overlays)) os)
-      (let ((o (make-overlay beg end)))
-        (setq racket--highlight-overlays (cons o racket--highlight-overlays))
-        (overlay-put o 'name 'racket-check-syntax-overlay)
-        (overlay-put o 'priority 100)
-        (overlay-put o 'face (if defp
-                                 racket-check-syntax-def-face
-                               racket-check-syntax-use-face))))))
+(defun racket-add-require-for-identifier ()
+  "Add a require for the identifier at point.
 
-(defun racket--unhighlight-all ()
-  (while racket--highlight-overlays
-    (delete-overlay (car racket--highlight-overlays))
-    (setq racket--highlight-overlays (cdr racket--highlight-overlays))))
+When more than one module supplies an identifer with the same
+name, they are listed for you to choose one. The list is sorted
+alphabetically, except modules starting with \"racket/\" and
+\"typed/racket/\" are sorted before others. While at the prompt,
+as a convenience you can press C-h to see the \"Search Manuals\"
+page for locally installed packages -- effectively like
+doing \"raco doc\" at the command line.
 
-(defun racket--non-empty-string-p (v)
-  (and (stringp v)
-       (not (string-match-p "\\`[ \t\n\r]*\\'" v)))) ;`string-blank-p'
+A \"require\" form is inserted into the buffer, followed by doing
+a `racket-tidy-requires'.
 
-(defun racket--point-entered (_old new)
-  (pcase (get-text-property new 'help-echo)
-    ((and s (pred racket--non-empty-string-p))
-     (if (and (boundp 'tooltip-mode)
-              tooltip-mode
-              (fboundp 'window-absolute-pixel-position))
-         (pcase (window-absolute-pixel-position new)
-           (`(,left . ,top)
-            (let ((tooltip-frame-parameters `((left . ,left)
-                                              (top . ,top)
-                                              ,@tooltip-frame-parameters)))
-              (tooltip-show s))))
-       (message "%s" s))))
-  (pcase (get-text-property new 'racket-check-syntax-def)
-    ((and uses `((,beg ,_end) . ,_))
-     (pcase (get-text-property beg 'racket-check-syntax-use)
-       (`(,beg ,end) (racket--highlight beg end t)))
-     (dolist (use uses)
-       (pcase use (`(,beg ,end) (racket--highlight beg end nil))))))
-  (pcase (get-text-property new 'racket-check-syntax-use)
-    (`(,beg ,end)
-     (racket--highlight beg end t)
-     (dolist (use (get-text-property beg 'racket-check-syntax-def))
-       (pcase use (`(,beg ,end) (racket--highlight beg end nil)))))))
-
-(defun racket--point-left (_old _new)
-  (racket--unhighlight-all))
-
-(defun racket-check-syntax-mode-quit ()
+Caveat: This works in terms of identifers that are documented.
+The mechanism is similar to that used for Racket's \"Search
+Manuals\" feature. Today there exists no system-wide database of
+identifiers that are exported but not documented."
   (interactive)
-  (racket-check-syntax-mode -1))
-
-(defun racket-check-syntax-mode-goto-def ()
-  "When point is on a use, go to its definition."
-  (interactive)
-  (pcase (get-text-property (point) 'racket-check-syntax-use)
-    (`(,beg ,_end) (goto-char beg))))
-
-(defun racket-check-syntax-mode-forward-use (amt)
-  "When point is on a use, go AMT uses forward. AMT may be negative.
-
-Moving before/after the first/last use wraps around.
-
-If point is instead on a definition, then go to its first use."
-  (pcase (get-text-property (point) 'racket-check-syntax-use)
-    (`(,beg ,_end)
-     (pcase (get-text-property beg 'racket-check-syntax-def)
-       (uses (let* ((pt (point))
-                    (ix-this (cl-loop for ix from 0 to (1- (length uses))
-                                      for use = (nth ix uses)
-                                      when (and (<= (car use) pt) (< pt (cadr use)))
-                                      return ix))
-                    (ix-next (+ ix-this amt))
-                    (ix-next (if (> amt 0)
-                                 (if (>= ix-next (length uses)) 0 ix-next)
-                               (if (< ix-next 0) (1- (length uses)) ix-next)))
-                    (next (nth ix-next uses)))
-               (goto-char (car next))))))
-    (_ (pcase (get-text-property (point) 'racket-check-syntax-def)
-         (`((,beg ,_end) . ,_) (goto-char beg))))))
-
-(defun racket-check-syntax-mode-goto-next-use ()
-  "When point is on a use, go to the next (sibling) use."
-  (interactive)
-  (racket-check-syntax-mode-forward-use 1))
-
-(defun racket-check-syntax-mode-goto-prev-use ()
-  "When point is on a use, go to the previous (sibling) use."
-  (interactive)
-  (racket-check-syntax-mode-forward-use -1))
-
-(defun racket-check-syntax-mode-help ()
-  (interactive)
-  (describe-function #'racket-check-syntax-mode))
-
-(defun racket-check-syntax-mode-rename ()
-  (interactive)
-  ;; If we're on a def, get its uses. If we're on a use, get its def.
-  (let* ((pt (point))
-         (uses (get-text-property pt 'racket-check-syntax-def))
-         (def  (get-text-property pt 'racket-check-syntax-use)))
-    ;; If we got one, get the other.
-    (when (or uses def)
-      (let* ((uses (or uses (get-text-property (car def)   'racket-check-syntax-def)))
-             (def  (or def  (get-text-property (caar uses) 'racket-check-syntax-use)))
-             (locs (cons def uses))
-             (strs (mapcar (lambda (loc)
-                             (apply #'buffer-substring-no-properties loc))
-                           locs)))
-        ;; Proceed only if all the strings are the same. (They won't
-        ;; be for e.g. import bindings.)
-        (when (cl-every (lambda (s) (equal (car strs) s))
-                        (cdr strs))
-          (let ((new (read-from-minibuffer (format "Rename %s to: " (car strs))))
-                (marker-pairs
-                 (mapcar (lambda (loc)
-                           (let ((beg (make-marker))
-                                 (end (make-marker)))
-                             (set-marker beg (nth 0 loc) (current-buffer))
-                             (set-marker end (nth 1 loc) (current-buffer))
-                             (list beg end)))
-                         locs))
-                (point-marker (let ((m (make-marker)))
-                                (set-marker m (point) (current-buffer)))))
-            (racket-check-syntax-mode -1)
-            (dolist (marker-pair marker-pairs)
-              (let ((beg (marker-position (nth 0 marker-pair)))
-                    (end (marker-position (nth 1 marker-pair))))
-                (delete-region beg end)
-                (goto-char beg)
-                (insert new)))
-            (goto-char (marker-position point-marker))
-            (racket-check-syntax-mode 1)))))))
-
-(defun racket-check-syntax-mode-goto-next-def ()
-  (interactive)
-  (let ((pos (next-single-property-change (point) 'racket-check-syntax-def)))
-    (when pos
-      (unless (get-text-property pos 'racket-check-syntax-def)
-        (setq pos (next-single-property-change pos 'racket-check-syntax-def)))
-      (and pos (goto-char pos)))))
-
-(defun racket-check-syntax-mode-goto-prev-def ()
-  (interactive)
-  (let ((pos (previous-single-property-change (point) 'racket-check-syntax-def)))
-    (when pos
-      (unless (get-text-property pos 'racket-check-syntax-def)
-        (setq pos (previous-single-property-change pos 'racket-check-syntax-def)))
-      (and pos (goto-char pos)))))
-
-(define-minor-mode racket-check-syntax-mode
-  "Analyze the buffer and annotate with information.
-
-The buffer becomes read-only until you exit this minor mode.
-However you may navigate the usual ways. When point is on a
-definition or use, related items are highlighted and
-information is displayed in the echo area. You may also use
-special commands to navigate among the definition and its uses.
-
-```
-\\{racket-check-syntax-mode-map}
-```
-"
-  :lighter " CheckSyntax"
-  :keymap (racket--easy-keymap-define
-           '(("q"               racket-check-syntax-mode-quit)
-             ("h"               racket-check-syntax-mode-help)
-             (("j" "TAB")       racket-check-syntax-mode-goto-next-def)
-             (("k" "<backtab>") racket-check-syntax-mode-goto-prev-def)
-             ("."               racket-check-syntax-mode-goto-def)
-             ("n"               racket-check-syntax-mode-goto-next-use)
-             ("p"               racket-check-syntax-mode-goto-prev-use)
-             ("r"               racket-check-syntax-mode-rename)))
   (unless (eq major-mode 'racket-mode)
-    (setq racket-check-syntax-mode nil)
-    (user-error "racket-check-syntax-mode only works with racket-mode"))
-  (racket--check-syntax-stop)
-  (when racket-check-syntax-mode
-    (racket--check-syntax-start)))
+    (user-error "Current buffer is not a racket-mode buffer"))
+  (let ((sym-at-point (thing-at-point 'symbol t)))
+    (unless sym-at-point
+      (user-error "There does not seem to be an identifier at point"))
+    (racket--cmd/async
+     nil
+     `(requires/find ,sym-at-point)
+     (lambda (result)
+       (let ((lib
+              (pcase result
+                (`()
+                 (message "\"%s\" is not a documented export of any installed library"
+                          sym-at-point)
+                 nil)
+                (`(,lib)
+                 lib)
+                (libs
+                 (let* ((map (prog1 (make-sparse-keymap)))
+                        (_   (set-keymap-parent map ido-completion-map))
+                        (_   (define-key map "\C-h"
+                               (lambda ()
+                                 (interactive)
+                                 (racket--search-doc-locally sym-at-point))))
+                        (overriding-local-map map))
+                   (ido-completing-read
+                    (format "\"%s\" is provided by multiple libraries, choose one (C-h to search manuals): "
+                            sym-at-point)
+                    libs))))))
+         (when lib
+           (let ((pt  (copy-marker (point)))
+                 (req `(require ,(intern lib))))
+             (racket--tidy-requires
+              (list req)
+              (lambda (result)
+                (goto-char pt)
+                (when result
+                  (message "Added \"%s\" and did racket-tidy-requires" req)))))))))))
 
-(defun racket--check-syntax-start ()
-  (let ((buf (current-buffer)))
-    (message "Running check-syntax analysis...")
-    (racket--cmd/async-raw
-     `(check-syntax ,(racket--buffer-file-name))
-     (lambda (response)
-       (with-current-buffer buf
-        (pcase response
-          (`(error ,m)
-           (racket-check-syntax-mode -1)
-           (error m))
-          (`(ok ())
-           (racket-check-syntax-mode -1)
-           (user-error "No bindings found"))
-          (`(ok ,xs)
-           (message "Marking up buffer...")
-           (racket--check-syntax-insert xs)
-           (message ""))))))))
-
-(defun racket--check-syntax-insert (xs)
-  (with-silent-modifications
-    (dolist (x xs)
-      (pcase x
-        (`(,`info ,beg ,end ,str)
-         (put-text-property beg end 'help-echo str))
-        (`(,`def/uses ,def-beg ,def-end ,uses)
-         (add-text-properties def-beg
-                              def-end
-                              (list 'racket-check-syntax-def uses
-                                    'point-entered #'racket--point-entered
-                                    'point-left    #'racket--point-left))
-         (dolist (use uses)
-           (pcase-let* ((`(,use-beg ,use-end) use))
-             (add-text-properties use-beg
-                                  use-end
-                                  (list 'racket-check-syntax-use (list def-beg
-                                                                       def-end)
-                                        'point-entered #'racket--point-entered
-                                        'point-left    #'racket--point-left)))))))
-    (setq buffer-read-only t)
-    (setq header-line-format
-          "Check Syntax. Buffer is read-only. Press h for help, q to quit.")
-    ;; Make 'point-entered and 'point-left work in Emacs 25+. Note
-    ;; that this is somewhat of a hack -- I spent a lot of time trying
-    ;; to Do the Right Thing using the new cursor-sensor-mode, but
-    ;; could not get it to work satisfactorily. See:
-    ;; http://emacs.stackexchange.com/questions/29813/point-motion-strategy-for-emacs-25-and-older
-    (setq-local inhibit-point-motion-hooks nil)
-    ;; Go to next definition, as an affordance/hint what this does:
-    (racket-check-syntax-mode-goto-next-def)))
-
-(defun racket--check-syntax-stop ()
-  (setq header-line-format nil)
-  (with-silent-modifications
-    (remove-text-properties (point-min)
-                            (point-max)
-                            '(help-echo nil
-                              racket-check-syntax-def nil
-                              racket-check-syntax-use nil
-                              point-entered
-                              point-left))
-    (racket--unhighlight-all)
-    (setq buffer-read-only nil)))
-
-
 ;;; align
 
 (defun racket-align ()
   "Align values in the same column.
 
-Useful for binding forms like `let` and `parameterize`,
-conditionals like `cond` and `match`, association lists, and any
-series of couples like the arguments to `hash`.
+Useful for binding forms like \"let\" and \"parameterize\",
+conditionals like \"cond\" and \"match\", association lists, and
+any series of couples like the arguments to \"hash\".
 
 Before choosing this command, put point on the first of a series
 of \"couples\". A couple is:
 
-- A list of two or more sexprs: `[sexpr val sexpr ...]`
-- Two sexprs: `sexpr val`.
+- A list of two or more sexprs: \"[sexpr val sexpr ...]\".
+- Two sexprs: \"sexpr val\".
 
-Each `val` moves to the same column and is
+Each \"val\" moves to the same column and is
 `prog-indent-sexp'-ed (in case it is a multi-line form).
 
-For example with point on the `[` before `a`:
+For example with point on the \"[\" before \"a\":
 
+#+BEGIN_SRC racket
     Before             After
 
     (let ([a 12]       (let ([a   12]
@@ -753,30 +384,37 @@ For example with point on the `[` before `a`:
           [b? (f x           [b?   (f x
                  y)]                  y)]
           [else #f])         [else #f])
+#+END_SRC
 
-Or with point on the `'` before `a`:
+Or with point on the quote before \"a\":
 
+#+BEGIN_SRC racket
     (list 'a 12        (list 'a   12
           'bar 23)           'bar 23)
+#+END_SRC
 
 If more than one couple is on the same line, none are aligned,
 because it is unclear where the value column should be. For
 example the following form will not change; `racket-align' will
 display an error message:
 
+#+BEGIN_SRC racket
     (let ([a 0][b 1]
           [c 2])       error; unchanged
       ....)
+#+END_SRC
 
 When a couple's sexprs start on different lines, that couple is
 ignored. Other, single-line couples in the series are aligned as
 usual. For example:
 
+#+BEGIN_SRC racket
     (let ([foo         (let ([foo
            0]                 0]
           [bar 1]            [bar 1]
           [x 2])             [x   2])
       ....)              ....)
+#+END_SRC
 
 See also: `racket-unalign'."
   (interactive)
@@ -837,6 +475,42 @@ When LISTP is true, expects couples to be `[id val]`, else `id val`."
               (up-list)
             (forward-sexp)))
       (scan-error nil))))
+
+;;; Completion
+
+(defvar racket--completion-candidates (list racket-type-list
+                                            racket-keywords
+                                            racket-builtins-1-of-2
+                                            racket-builtins-2-of-2))
+
+(defun racket--completion-candidates-for-prefix (prefix)
+  (cl-reduce (lambda (results strs)
+               (append results (all-completions prefix strs)))
+             racket--completion-candidates
+             :initial-value ()))
+
+(defun racket-complete-at-point ()
+  "A value for the variable `completion-at-point-functions'.
+
+Completion candidates are drawn from the same symbols used for
+font-lock. This is a static list. If you want dynamic, smarter
+completion candidates, enable the minor mode `racket-xp-mode'."
+  (racket--call-with-completion-prefix-positions
+   (lambda (beg end)
+     (list beg
+           end
+           (completion-table-dynamic
+            #'racket--completion-candidates-for-prefix)
+           :predicate #'identity
+           :exclusive 'no))))
+
+;;; lispy
+
+;; <https://github.com/abo-abo/lispy/blob/master/le-racket.el> expects
+;; this in 'racket-edit
+(define-obsolete-function-alias 'racket-lispy-visit-symbol-definition
+  #'xref-find-definitions "2020-11"
+  "Function called by lispy.el's `lispy-goto-symbol' for Racket.")
 
 (provide 'racket-edit)
 

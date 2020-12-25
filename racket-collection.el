@@ -1,6 +1,6 @@
-;;; racket-collection.el
+;;; racket-collection.el -*- lexical-binding: t; -*-
 
-;; Copyright (c) 2013-2016 by Greg Hendershott.
+;; Copyright (c) 2013-2020 by Greg Hendershott.
 ;; Portions Copyright (C) 1985-1986, 1999-2013 Free Software Foundation, Inc.
 
 ;; Author: Greg Hendershott
@@ -23,13 +23,14 @@
 (require 'racket-custom) ;for `racket-program'
 (require 'racket-util)
 
-
 ;;; racket-find-collection
 
 (defun racket-find-collection (&optional prefix)
   "Given a collection name, try to find its directory and files.
 
-Takes a collection name from point (or, with a prefix, prompts you).
+Takes a collection name from point.
+
+With \\[universal-argument] prompts you.
 
 If only one directory is found, `ido-find-file-in-dir' lets you
 pick a file there.
@@ -46,28 +47,32 @@ installed. To install it, in `shell' enter:
 Tip: This works best with `ido-enable-flex-matching' set to t.
 Also handy is the `flx-ido' package from MELPA.
 
-See also: `racket-visit-module' and `racket-open-require-path'."
+See also: `racket-open-require-path'."
   (interactive "P")
   (pcase (racket--symbol-at-point-or-prompt prefix "Collection name: ")
     (`() nil)
     (coll
-     (pcase (racket--cmd/await `(find-collection ,coll))
-       (`()
-        (user-error (format "Collection `%s' not found" coll)))
-       (`(,path)
-        (racket--find-file-in-dir path))
-       (paths
-        (let ((done nil))
-          (while (not done)
-            ;; `(ido-find-file-in-dir (ido-completing-read paths))`
-            ;; -- except we want to let the user press C-g inside
-            ;; ido-find-file-in-dir to back up and pick a different
-            ;; module path.
-            (let ((dir (ido-completing-read "Directory: " paths)))
-              (condition-case ()
-                  (progn (racket--find-file-in-dir dir)
-                         (setq done t))
-                (quit nil))))))))))
+     (racket--cmd/async
+      nil
+      `(find-collection ,coll)
+      (lambda (result)
+        (pcase result
+          (`()
+           (user-error (format "Collection `%s' not found" coll)))
+          (`(,path)
+           (racket--find-file-in-dir path))
+          (paths
+           (let ((done nil))
+             (while (not done)
+               ;; `(ido-find-file-in-dir (ido-completing-read paths))`
+               ;; -- except we want to let the user press C-g inside
+               ;; ido-find-file-in-dir to back up and pick a different
+               ;; module path.
+               (let ((dir (ido-completing-read "Directory: " paths)))
+                 (condition-case ()
+                     (progn (racket--find-file-in-dir dir)
+                            (setq done t))
+                   (quit nil))))))))))))
 
 (defun racket--find-file-in-dir (dir)
   "Like `ido-find-file-in-dir', but allows C-d to `dired' as does `ido-find-file'."
@@ -131,30 +136,18 @@ See also: `racket-visit-module' and `racket-open-require-path'."
       racket--orp/nop))))
 
 (defun racket--orp/process ()
-  "Start process to run find-module-path-completions.rkt.
-
-To do so, prefer `make-process' when available (Emacs 25.1+)
-because we can filter stderr. This helps e.g. when Racket core
-developers insert an eprintf in racket/base.rkt or similar -- see
-issue #345."
+  "Start process to run find-module-path-completions.rkt."
   (let ((name   "racket-find-module-path-completions-process")
         (buffer " *racket-find-module-path-completions*")
-        (stderr " *racket-find-module-path-completions-stderr*"))
-    (if (fboundp 'make-process)
-        (make-process :name name
-                      :buffer buffer
-                      :command (list
-                                racket-program
-                                (expand-file-name "find-module-path-completions.rkt"
-                                                  racket--rkt-source-dir))
-                      :connection-type 'pipe
-                      :stderr stderr)
-      (let ((process-connection-type nil)) ;use pipe not tty
-        (start-process name
-                       buffer
-                       racket-program
-                       (expand-file-name "find-module-path-completions.rkt"
-                                         racket--rkt-source-dir))))))
+        (stderr " *racket-find-module-path-completions-stderr*")
+        (rkt    (funcall racket-adjust-run-rkt
+                         (expand-file-name "find-module-path-completions.rkt"
+                                           racket--rkt-source-dir))))
+    (make-process :name            name
+                  :buffer          buffer
+                  :command         (list racket-program rkt)
+                  :connection-type 'pipe
+                  :stderr          stderr)))
 
 (defun racket--orp/begin ()
   (setq racket--orp/tq (tq-create (racket--orp/process))))
@@ -171,7 +164,8 @@ issue #345."
 (defun racket--orp/rx-matches (buffer answer)
   "Completion proc; receives answer to request by `racket--orp/request-tx-matches'."
   (when racket--orp/active
-    (setq racket--orp/matches (split-string answer "\n" t))
+    (setq racket--orp/matches (mapcar racket-path-from-racket-to-emacs-function
+                                      (split-string answer "\n" t)))
     (setq racket--orp/match-index 0)
     (with-current-buffer buffer
       (racket--orp/draw-matches))))
@@ -193,10 +187,7 @@ at the top, marked with \"->\".
 - C-n and C-p move among the choices.
 - RET on a directory adds its contents to the choices.
 - RET on a file exits doing `find-file'.
-- C-g aborts.
-
-Note: This requires Racket 6.1.1.6 or newer. Otherwise it won't
-error, it will just never return any matches."
+- C-g aborts."
   (interactive)
   (racket--orp/begin)
   (setq racket--orp/active t)
@@ -289,7 +280,6 @@ Also constrain point in case user tried to navigate past
       (cond (;; Pressing RET on a directory inserts its contents, like
              ;; "Enter subcollection" button in DrR.
              (and match (file-directory-p match))
-             (racket--trace "enter" 'add-subdir)
              (setq racket--orp/matches
                    (delete-dups ;if they RET same item more than once
                     (sort (append racket--orp/matches
@@ -301,14 +291,12 @@ Also constrain point in case user tried to navigate past
              ;; racket--orp/matches and racket--orp/match-index as a
              ;; choice (as opposed to quitting w/o a choice.
              t
-             (racket--trace "enter" 'exit-minibuffer)
              (exit-minibuffer))))))
 
 (defun racket--orp/quit ()
   "Our replacement for `keyboard-quit'."
   (interactive)
   (when racket--orp/active
-    (racket--trace "quit")
     (setq racket--orp/input "")
     (setq racket--orp/matches nil)
     (exit-minibuffer)))

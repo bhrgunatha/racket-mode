@@ -1,6 +1,6 @@
 ;;; racket-stepper.el -*- lexical-binding: t; -*-
 
-;; Copyright (c) 2018 by Greg Hendershott.
+;; Copyright (c) 2018-2020 by Greg Hendershott.
 ;; Portions Copyright (C) 1985-1986, 1999-2013 Free Software Foundation, Inc.
 
 ;; Author: Greg Hendershott
@@ -18,7 +18,7 @@
 
 (require 'easymenu)
 (require 'rx)
-(require 'racket-common)
+(require 'racket-cmd)
 (require 'racket-custom)
 (require 'racket-repl)
 (require 'racket-util)
@@ -47,19 +47,16 @@
 
 (define-derived-mode racket-stepper-mode special-mode "Racket-Stepper"
   "Major mode for Racket stepper output.
+\\<racket-stepper-mode-map>
 
 Used by the commands `racket-expand-file',
 `racket-expand-definition', `racket-expand-region', and
 `racket-expand-last-sexp'.
 
-\\<racket-stepper-mode-map>
-
-```
 \\{racket-stepper-mode-map}
-```
 "
   (setq header-line-format
-        "Press RET to step. C-h m to see help.")
+        "Press RET to step. C-u RET to step all. C-h m to see help.")
   (setq-local font-lock-defaults
               (list racket-stepper-font-lock-keywords
                     t)))        ;keywords only -- not strings/comments
@@ -80,8 +77,8 @@ If the file is non-trivial and/or is not compiled to a .zo
 bytecode file, then it might take many seconds before the
 original form is displayed and you can start stepping.
 
-With a prefix, also expands syntax from racket/base -- which can
-result in very many expansion steps."
+With \\[universal-argument] also expands syntax from racket/base
+-- which can result in very many expansion steps."
   (interactive "P")
   (unless (eq major-mode 'racket-mode)
     (user-error "Only works in racket-mode buffer"))
@@ -131,11 +128,21 @@ Uses Racket's `expand-once` in the namespace from the most recent
                             (buffer-substring-no-properties beg end)
                             prefix))))
 
+(defvar racket--stepper-repl-session-id nil
+  "The REPL session used when stepping.
+May be nil for 'file stepping, but must be valid for 'expr stepping.")
+
 (defun racket-stepper--start (which str into-base)
   "Ensure buffer and issue initial command.
 WHICH should be 'expr or 'file.
 STR should be the expression or pathname.
-INTO-BASE is treated as a raw prefix arg and converted to boolp."
+INTO-BASE is treated as a raw command prefix arg and converted to boolp."
+  (unless (eq major-mode 'racket-mode)
+    (error "Only works from racket-mode buffers"))
+  (setq racket--stepper-repl-session-id (racket--repl-session-id))
+  (unless (or racket--stepper-repl-session-id
+              (eq which 'file))
+    (error "Only works when the racket-mode buffer has a REPL buffer, and, you should racket-run first"))
   ;; Create buffer if necessary
   (unless (get-buffer racket-stepper--buffer-name)
     (with-current-buffer (get-buffer-create racket-stepper--buffer-name)
@@ -148,27 +155,30 @@ INTO-BASE is treated as a raw prefix arg and converted to boolp."
   (let ((inhibit-read-only t))
     (delete-region (point-min) (point-max))
     (insert "Starting macro expansion stepper... please wait...\n"))
-  (racket--cmd/async `(macro-stepper (,which . ,str)
+  (racket--cmd/async racket--stepper-repl-session-id
+                     `(macro-stepper (,which . ,str)
                                      ,(and into-base t))
                      #'racket-stepper--insert))
 
-(defun racket-stepper--insert (step)
+(defun racket-stepper--insert (steps)
   (with-current-buffer racket-stepper--buffer-name
     (let ((inhibit-read-only t))
       (goto-char (point-max))
-      (pcase step
-        (`(original . ,text)
-         (delete-region (point-min) (point-max))
-         (insert "Original\n" text "\n" "\n"))
-        (`(final    . ,text) (insert "Final\n" text "\n"))
-        (`(,label   . ,diff) (insert label "\n" diff "\n")))
+      (dolist (step steps)
+        (pcase step
+          (`(original . ,text)
+           (delete-region (point-min) (point-max))
+           (insert "Original\n" text "\n" "\n"))
+          (`(final    . ,text) (insert "Final\n" text "\n"))
+          (`(,label   . ,diff) (insert label "\n" diff "\n"))))
       (racket-stepper-previous-item)
       (when (equal (selected-window) (get-buffer-window (current-buffer)))
         (recenter)))))
 
-(defun racket-stepper-step ()
-  (interactive)
-  (racket--cmd/async `(macro-stepper/next)
+(defun racket-stepper-step (prefix)
+  (interactive "P")
+  (racket--cmd/async racket--stepper-repl-session-id
+                     `(macro-stepper/next ,(if prefix 'all 'next))
                      #'racket-stepper--insert))
 
 (defconst racket-stepper--item-rx
@@ -179,8 +189,9 @@ INTO-BASE is treated as a raw prefix arg and converted to boolp."
 
 An \"item\" is a line starting with a log level in brackets.
 
-Interactively, N is the numeric prefix argument.
-If N is omitted or nil, move point 1 item forward."
+Interactively, N is the numeric \\[universal-argument] command
+prefix argument. If N is omitted or nil, move point 1 item
+forward."
   (interactive "P")
   (forward-char 1)
   (if (re-search-forward racket-stepper--item-rx nil t count)
@@ -192,8 +203,9 @@ If N is omitted or nil, move point 1 item forward."
 
 An \"item\" is a line starting with a log level in brackets.
 
-Interactively, N is the numeric prefix argument.
-If N is omitted or nil, move point 1 item backward."
+Interactively, N is the numeric \\[universal-argument] command
+prefix argument. If N is omitted or nil, move point 1 item
+backward."
   (interactive "P")
   (re-search-backward racket-stepper--item-rx nil t count))
 
